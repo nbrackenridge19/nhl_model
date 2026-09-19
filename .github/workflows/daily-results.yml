@@ -1,0 +1,40 @@
+name: NHL Daily Results Ingest
+
+on:
+  schedule:
+    - cron: '0 13 * * *'  # 13:00 UTC daily (~8-9am ET) — timing doesn't matter for this job
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (true = no DB writes)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests psycopg2-binary beautifulsoup4
+
+      - name: Run daily results ingest
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGPORT: ${{ secrets.PGPORT }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+        run: python scripts/nhl_daily_results_ingest.py
