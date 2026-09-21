@@ -21,3 +21,6 @@ jobs:
 
       - name: Run source check
         run: python scripts/nhl_check_sources.py
+
+      - name: Run ESPN event-lookup check (odds groundwork)
+        run: python scripts/nhl_diagnose_espn_event_lookup.py 2026-09-19 2026-09-20
