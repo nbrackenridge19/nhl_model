@@ -34,7 +34,7 @@ gamelog2526.xlsm's ALL sheet and per-team tabs (e.g. 'CHI'):
   where n = this team's completed games so far this season (before this
   game's date), _td = that team's own cumulative total prior to this game,
   and cf_int/cf_pycf/pp_int/pp_pypp/pk_int/pk_pypk are season-level
-  regression-to-prior-season-value constants (see REGRESSION_CONSTANTS
+  regression-to-prior-season-value constants (see REGRESSION_CONSTANTS_BY_SEASON
   below — read directly from gamelog2526.xlsm ALL!Z2:Z7. These are refit
   once per season; if this script is still in use next season, re-pull
   them from that season's gamelog workbook before relying on this file).
@@ -87,18 +87,45 @@ version of this script incorrectly read from the All Situations table's
 tbody, which produced garbage (no tfoot check, no situational distinction)
 — this was caught and fixed during the Project 3 backfill; see chat.
 
+SEASON ROLLOVER CHANGES (2026-27) — see chat for the reasoning behind each
+--------------------------------------------------------------------------
+1. Games are matched to the pre-loaded schedule rows in `games` on
+   (date, home, away) instead of allocating new game_ids by counting. Only
+   playoff games (not in the schedule) still get new 'P' ids.
+2. Self-healing: every run also processes any schedule game from the last
+   LOOKBACK_DAYS (default 7) that still has no score, oldest date first, so
+   a missed or failed run is caught up automatically. Already-ingested games
+   are skipped, so re-running is safe.
+3. Season and prior season come from season_config (no hardcoded 2526).
+4. Regression constants are looked up per season; the run aborts if the
+   season has no entry rather than silently using last season's.
+5. team_game_stats_raw is now written each day (it was only backfilled, so
+   the CF/PP/PK blends could never move off the prior-season prediction).
+6. New players are inserted into `players` before their appearances (the
+   foreign key used to make the whole upsert fail), and any skater without a
+   prior-season/rookie row (or goalie without career priors) is written to
+   player_review_queue and printed as ACTION NEEDED.
+7. ESPN abbreviations (tb, sj, nj, la, vgk) are converted to our team codes.
+8. Preseason and other non-schedule games are skipped (they never match a
+   schedule row). Playoffs are handled only if ESPN marks them season type 3.
+9. Refresh chain fixed: it now includes v_team_game_perspective (without it
+   new games never reached the bet/result views). The v2/v4 experiment chain
+   is refreshed only when REFRESH_EXPERIMENTAL=true. Each view is refreshed
+   and committed on its own.
+
 SAFETY
 ------
 - DB connection: PGHOST/PGUSER/PGPASSWORD/PGDATABASE/PGPORT env vars.
-- DRY_RUN defaults to true.
-- Designed to run once per morning for "yesterday's" completed games; not
-  the T-5 pre-game path (that's a separate script — lineups/odds/goalies).
+- DRY_RUN defaults to true. In a dry run nothing is written, so later dates in
+  a catch-up run are computed without the earlier dates' rows (approximate).
+- INGEST_DATE=YYYY-MM-DD processes just that date (for testing).
+- Designed to run once per morning; not the T-5 pre-game path.
 """
 
 import os
 import re
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import requests
 import psycopg2
@@ -115,22 +142,47 @@ ESPN_SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/sum
 # Read from gamelog2526.xlsm ALL!Z2:Z7 this session — refit once per
 # season. Re-pull from the current season's gamelog workbook if this
 # script is reused next season.
-REGRESSION_CONSTANTS = {
-    "cf_int": 0.1448593885572126, "cf_pycf": 0.7121483119094089,
-    "pp_int": 0.11751272458282204, "pp_pypp": 0.4145979201770057,
-    "pk_int": 0.5684377783357512, "pk_pypk": 0.2890725321972133,
+REGRESSION_CONSTANTS_BY_SEASON = {
+    # 2025-26: read from gamelog2526.xlsm ALL!Z2:Z7 ("2017-18 to 2024-25").
+    "2526": {
+        "cf_int": 0.1448593885572126, "cf_pycf": 0.7121483119094089,
+        "pp_int": 0.11751272458282204, "pp_pypp": 0.4145979201770057,
+        "pk_int": 0.5684377783357512, "pk_pypk": 0.2890725321972133,
+    },
+    # 2026-27: PROVISIONAL. OLS of each team's end-of-season value on its prior
+    # season's, pooled over 2017-18 -> 2025-26 (252 team-season pairs, Arizona
+    # mapped to Utah), computed from team_game_stats. My reproduction of the
+    # 2025-26 constants this way lands close but not exactly on the Excel
+    # values (e.g. cf 0.1424/0.7174 vs 0.1449/0.7121), so replace these with
+    # the constants from the original regression when they are available.
+    "2627": {
+        "cf_int": 0.137568952186152, "cf_pycf": 0.727128564565087,
+        "pp_int": 0.124030525955121, "pp_pypp": 0.400801388107046,
+        "pk_int": 0.607263925916057, "pk_pypk": 0.234558133237551,
+    },
 }
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "7"))
+REFRESH_EXPERIMENTAL = os.environ.get("REFRESH_EXPERIMENTAL", "false").strip().lower() == "true"
+
+
+def regression_constants(season):
+    if season not in REGRESSION_CONSTANTS_BY_SEASON:
+        raise RuntimeError(
+            f"No regression constants for season {season}. Add them to REGRESSION_CONSTANTS_BY_SEASON "
+            "(refit each season) before running this script for that season.")
+    return REGRESSION_CONSTANTS_BY_SEASON[season]
 BLEND_GAME_THRESHOLD = 40  # games after which the blend is pure season-to-date
 GOALIE_SHOTS_FLOOR = 1050  # min(shots) denominator floor in the SvPctR blend
 
-TEAM_CODE_NORMALIZE = {"vgk": "veg", "was": "wsh"}
+# ESPN abbreviation -> our team_code (only the ones that differ).
+ESPN_TO_INTERNAL = {"tb": "tbl", "sj": "sjs", "nj": "njd", "la": "lak", "vgk": "veg", "was": "wsh", "utah": "uta"}
 
 # ESPN uses different abbreviations than our internal team_code for these 5
 # teams (confirmed via live ESPN pages during the Project 3 backfill spot
 # check) — every other team's ESPN abbreviation matches our team_code
 # exactly. Used only for the ESPN PP/PK lookup below.
 ESPN_TEAM_CODE_MAP = {"tbl": "tb", "sjs": "sj", "njd": "nj", "lak": "la", "veg": "vgk"}
-ESPN_TEAM_CODE_MAP_REVERSE = {v: k for k, v in ESPN_TEAM_CODE_MAP.items()}
+ESPN_TEAM_CODE_MAP_REVERSE = dict(ESPN_TO_INTERNAL)
 
 
 def get_db_conn():
@@ -140,7 +192,8 @@ def get_db_conn():
 
 
 def normalize_team_code(code):
-    return TEAM_CODE_NORMALIZE.get(code, code)
+    """ESPN abbreviation -> our team_code."""
+    return ESPN_TO_INTERNAL.get(code, code)
 
 
 def normalize_player_name(raw):
@@ -392,25 +445,10 @@ def parse_team_cf_ca_5v5(table):
 
 # --------------------------- ESPN PP/PK lookup (UNCONFIRMED — see docstring) ---------------------------
 
-def fetch_espn_pp_pk(game_date, home_team, away_team):
+def fetch_espn_pp_pk(event_id):
     """Returns {team_code: {'pp_goals':, 'pp_opp':, 'pk_goals_against':, 'pk_opp':}}
-    or {} if not found. UNCONFIRMED against a real completed game — verify
-    on first live run (see module docstring)."""
-    home_espn = ESPN_TEAM_CODE_MAP.get(home_team, home_team)
-    away_espn = ESPN_TEAM_CODE_MAP.get(away_team, away_team)
-    try:
-        sb = requests.get(ESPN_SCOREBOARD_URL, params={"dates": game_date.strftime("%Y%m%d")},
-                           headers=HEADERS, timeout=20).json()
-    except Exception:
-        return {}
-    event_id = None
-    for ev in sb.get("events", []):
-        comp = (ev.get("competitions") or [{}])[0]
-        competitors = comp.get("competitors") or []
-        names = {c.get("team", {}).get("abbreviation", "").lower() for c in competitors}
-        if {home_espn, away_espn} & names:
-            event_id = ev.get("id")
-            break
+    or {} if not found. Field names UNCONFIRMED against a real completed game —
+    verify with nhl_diagnose_espn_pp_pk.py (see module docstring)."""
     if event_id is None:
         return {}
     try:
@@ -510,8 +548,7 @@ def league_avg_sv_pct_today(conn, season, before_date, prior_two_season_avg):
 def compute_team_game_stats_row(conn, game_id, game_date, season, prior_season, team_code, is_home,
                                  attendance, starting_goalie_id, cf_today, ca_today, pp_pk_espn):
     n = games_played_before(conn, team_code, season, game_date)
-    back_to_back = games_played_before(conn, team_code, season, game_date) > 0 and \
-        prior_season_value(conn, team_code, season, "attendance") is not None  # placeholder, replaced below
+    rc = regression_constants(season)
     with conn.cursor() as cur:
         cur.execute(
             "select 1 from games where (home_team=%s or away_team=%s) and date = %s - interval '1 day'",
@@ -521,12 +558,12 @@ def compute_team_game_stats_row(conn, game_id, game_date, season, prior_season, 
 
     cf_td, ca_td = cumulative_cf_ca(conn, team_code, season, game_date)
     prior_cf = prior_season_value(conn, team_code, prior_season, "corsi_for_pct") or 0.5
-    cf_pred = REGRESSION_CONSTANTS["cf_int"] + REGRESSION_CONSTANTS["cf_pycf"] * prior_cf
+    cf_pred = rc["cf_int"] + rc["cf_pycf"] * prior_cf
     corsi_for_pct = blended_rate(n, cf_pred, cf_td, cf_td + ca_td)
 
     pp_stats = pp_pk_espn.get(team_code, {})
     prior_pp = prior_season_value(conn, team_code, prior_season, "pp") or 0.2
-    pp_pred = REGRESSION_CONSTANTS["pp_int"] + REGRESSION_CONSTANTS["pp_pypp"] * prior_pp
+    pp_pred = rc["pp_int"] + rc["pp_pypp"] * prior_pp
     with conn.cursor() as cur:
         cur.execute(
             "select coalesce(sum(pp_goals_raw),0), coalesce(sum(pp_opp_raw),0) from team_game_stats_raw "
@@ -537,7 +574,7 @@ def compute_team_game_stats_row(conn, game_id, game_date, season, prior_season, 
     pp = blended_rate(n, pp_pred, ppg_td, ppo_td)
 
     prior_pk = prior_season_value(conn, team_code, prior_season, "pk") or 0.8
-    pk_pred = REGRESSION_CONSTANTS["pk_int"] + REGRESSION_CONSTANTS["pk_pypk"] * prior_pk
+    pk_pred = rc["pk_int"] + rc["pk_pypk"] * prior_pk
     with conn.cursor() as cur:
         cur.execute(
             "select coalesce(sum(pk_ga_raw),0), coalesce(sum(pk_opp_raw),0) from team_game_stats_raw "
@@ -556,6 +593,12 @@ def compute_team_game_stats_row(conn, game_id, game_date, season, prior_season, 
                 "select career_shots, career_sv_pct_above_expected, league_avg_sv_pct "
                 "from goalie_career_priors where player_id = %s", (starting_goalie_id,))
             prior_row = cur.fetchone()
+            if prior_row is None:
+                # New goalie with no NHL history in the priors table: career = 0 shots, exactly what the
+                # Excel formula does (SUMIFS returns 0), so SvPctR is built from this season alone.
+                cur.execute("select league_avg_sv_pct from goalie_career_priors limit 1")
+                lg_row = cur.fetchone()
+                prior_row = (0, 0.0, lg_row[0]) if lg_row else None
         if prior_row:
             career_shots, career_svae, league_avg = prior_row
             with conn.cursor() as cur:
@@ -600,114 +643,381 @@ def upsert(conn_factory, table, rows, conflict_cols, all_cols):
         conn.close()
 
 
+# --------------------------- materialized view refresh ---------------------------
+
+# Main chain, in dependency order. v_team_game_perspective is what carries new
+# games into the bet/result views (it was missing from the original list).
+MAIN_REFRESH_CHAIN = [
+    "v_player_cumulative_stats", "v_pvadj", "v_team_cumulative_stats", "v_team_game_pvadjsum",
+    "v_team_game_perspective", "v_team_trailing_perf", "v_lambda", "v_team_kf",
+    "v_edge_threshold_by_season", "v_kelly_signal", "v_kelly_daily_return",
+    "v_kelly_bank_theoretical", "v_kelly_bank_live",
+]
+# v2/v4 model variants and the expected-goal-difference views they use. Not part
+# of the live betting chain; refreshed only when REFRESH_EXPERIMENTAL=true.
+EXPERIMENTAL_REFRESH_CHAIN = [
+    "v_expgd", "v_team_game_gd", "v_team_trailing_gd_error", "v_errord",
+    "v_model_pct_v2", "v_model_pct_v4",
+    "v_team_game_perspective_v2", "v_team_game_perspective_v4",
+    "v_team_trailing_perf_v2", "v_lambda_v2",
+    "v_team_kf_v2", "v_team_kf_v4",
+    "v_edge_threshold_by_season_v2", "v_edge_threshold_by_season_v4",
+    "v_kelly_signal_v2", "v_kelly_signal_v4",
+]
+
+
 def refresh_materialized_views(conn_factory):
+    chain = list(MAIN_REFRESH_CHAIN) + (EXPERIMENTAL_REFRESH_CHAIN if REFRESH_EXPERIMENTAL else [])
+    for view in chain:
+        t0 = time.time()
+        conn = conn_factory()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("set statement_timeout = 0")  # v_team_game_perspective alone takes ~2 minutes
+                cur.execute(f"refresh materialized view {view}")
+            conn.commit()
+            print(f"  refreshed {view} ({time.time() - t0:.0f}s)")
+        except Exception as e:  # stop: everything downstream would be stale/inconsistent
+            conn.rollback()
+            print(f"  FAILED refreshing {view}: {e}")
+            raise
+        finally:
+            conn.close()
+    print("Refreshed materialized view chain.")
+
+
+# --------------------------- season / schedule helpers ---------------------------
+
+def et_today():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).date()
+    except Exception:
+        return (datetime.utcnow() - timedelta(hours=5)).date()
+
+
+def prior_season_code(season):
+    return f"{int(season[:2]) - 1:02d}{int(season[2:]) - 1:02d}"
+
+
+def season_for_date(conn, d):
+    with conn.cursor() as cur:
+        cur.execute("select season from season_config where season_start_date <= %s "
+                    "order by season_start_date desc limit 1", (d,))
+        row = cur.fetchone()
+    if not row:
+        raise RuntimeError(f"No season_config row starts on or before {d}.")
+    return row[0]
+
+
+def pending_dates(conn, season, today, lookback_days):
+    """Dates in the last `lookback_days` with schedule games that still have no score."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "select distinct date from games where season=%s and playoff=false and home_goals is null "
+            "and date < %s and date >= %s order by date", (season, today, today - timedelta(days=lookback_days)))
+        return [r[0] for r in cur.fetchall()]
+
+
+def parse_scoreboard_events(sb):
+    """ESPN scoreboard JSON -> list of {event_id, home, away, final, season_type} (our team codes)."""
+    out = []
+    for ev in sb.get("events", []) or []:
+        comp = (ev.get("competitions") or [{}])[0]
+        competitors = comp.get("competitors") or []
+        home = next((c for c in competitors if c.get("homeAway") == "home"), None)
+        away = next((c for c in competitors if c.get("homeAway") == "away"), None)
+        if not (home and away):
+            continue
+        st = (ev.get("status") or {}).get("type") or {}
+        final = bool(st.get("completed")) or st.get("state") == "post" or "FINAL" in str(st.get("name", "")).upper()
+        out.append({
+            "event_id": ev.get("id"),
+            "home": normalize_team_code(str(home.get("team", {}).get("abbreviation", "")).lower()),
+            "away": normalize_team_code(str(away.get("team", {}).get("abbreviation", "")).lower()),
+            "final": final,
+            "season_type": (ev.get("season") or {}).get("type"),
+        })
+    return out
+
+
+def fetch_scoreboard(d):
+    r = requests.get(ESPN_SCOREBOARD_URL, params={"dates": d.strftime("%Y%m%d")}, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    return parse_scoreboard_events(r.json())
+
+
+def resolve_scheduled_game(conn, season, game_date, home, away):
+    """Match a played game to its pre-loaded schedule row.
+    Returns (game_id, already_ingested, note) or None if it is not on the schedule."""
+    with conn.cursor() as cur:
+        cur.execute("select game_id, home_goals from games where season=%s and playoff=false and date=%s "
+                    "and home_team=%s and away_team=%s", (season, game_date, home, away))
+        row = cur.fetchone()
+        if row:
+            return row[0], row[1] is not None, None
+        # Possible reschedule: exactly one unplayed row for this matchup on another date
+        cur.execute("select game_id, date from games where season=%s and playoff=false and home_team=%s "
+                    "and away_team=%s and home_goals is null order by date", (season, home, away))
+        cands = cur.fetchall()
+    if len(cands) == 1:
+        return cands[0][0], False, f"schedule had {cands[0][1]}, played {game_date} (schedule row will be re-dated)"
+    return None
+
+
+def find_playoff_game(conn, season, game_date, home, away):
+    with conn.cursor() as cur:
+        cur.execute("select game_id, home_goals from games where season=%s and playoff=true and date=%s "
+                    "and home_team=%s and away_team=%s", (season, game_date, home, away))
+        return cur.fetchone()
+
+
+# --------------------------- new players / review queue ---------------------------
+
+SKATER_COVERED_SQL = """
+select
+  exists (select 1 from prior_season_stats where season = %(prior)s and player_name_normalized = %(nm)s)
+  or exists (select 1 from rookie_projections where season = %(season)s and player_name_normalized = %(nm)s)
+  or exists (select 1 from player_aliases pa join prior_season_stats s
+              on s.player_name_normalized = pa.alias_name_normalized and s.season = %(prior)s
+             where pa.player_id = %(pid)s)
+  or exists (select 1 from player_aliases pa join rookie_projections r
+              on r.player_name_normalized = pa.alias_name_normalized and r.season = %(season)s
+             where pa.player_id = %(pid)s)
+"""
+
+
+def existing_player_ids(conn, ids):
+    if not ids:
+        return set()
+    with conn.cursor() as cur:
+        cur.execute("select player_id from players where player_id = any(%s)", (list(ids),))
+        return {r[0] for r in cur.fetchall()}
+
+
+def insert_new_players(conn_factory, new_players):
+    if not new_players:
+        return
+    if DRY_RUN:
+        print(f"  [dry-run] players: would insert {len(new_players)} new: "
+              + ", ".join(f"{n} ({p})" for p, n in list(new_players.items())[:10]))
+        return
     conn = conn_factory()
     try:
         with conn.cursor() as cur:
-            for view in [
-                "v_player_cumulative_stats", "v_pvadj", "v_team_cumulative_stats",
-                "v_team_game_pvadjsum", "v_team_trailing_perf", "v_team_trailing_gd_error",
-                "v_lambda", "v_edge_threshold_by_season", "v_team_kf", "v_kelly_signal",
-                "v_kelly_daily_return", "v_kelly_bank_theoretical", "v_kelly_bank_live",
-            ]:
-                cur.execute(f"refresh materialized view {view}")
+            execute_values(cur, "insert into players (player_id, player_name_display) values %s "
+                                "on conflict (player_id) do nothing", list(new_players.items()))
         conn.commit()
-        print("Refreshed materialized view chain.")
+        print(f"  [live] players: inserted {len(new_players)} new")
     finally:
         conn.close()
 
 
+def players_needing_review(conn, season, prior_season, skaters, goalies, new_ids):
+    """Skaters with no prior-season stats / rookie row. (Goalies with no career prior need no
+    action: SvPctR treats them as zero career shots, as the Excel does.)"""
+    out, seen = [], set()
+    goalie_ids = {g["player_id"] for g in goalies}
+    for r in skaters:
+        pid = r["player_id"]
+        if pid in seen or pid in goalie_ids:
+            continue
+        seen.add(pid)
+        nm = (r.get("player_name_display") or "").strip().lower()
+        with conn.cursor() as cur:
+            cur.execute(SKATER_COVERED_SQL, {"pid": pid, "nm": nm, "prior": prior_season, "season": season})
+            covered = cur.fetchone()[0]
+        if not covered:
+            out.append({"player_id": pid, "player_name_display": r.get("player_name_display"),
+                        "team_code": r["team_code"], "game_id": r["game_id"],
+                        "reason": "no prior-season stats or rookie entry", "is_new": pid in new_ids})
+    return out
+
+
+def report_review(conn_factory, review_rows, game_dates):
+    if not review_rows:
+        return
+    lines = ["ACTION NEEDED - skaters with no prior-season stats or rookie entry:"]
+    for r in review_rows:
+        lines.append(f"  {r['player_name_display']} ({r['player_id']}, {r['team_code'].upper()}, first seen {r['game_id']}) "
+                     f"- {r['reason']}{' [new to database]' if r['is_new'] else ''}")
+    text = "\n".join(lines)
+    print(text)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write("### " + lines[0] + "\n\n" + "\n".join("- " + l.strip() for l in lines[1:]) + "\n")
+    if DRY_RUN:
+        print("  [dry-run] player_review_queue: would record the above")
+        return
+    values = [(r["player_id"], r["player_name_display"], r["team_code"], r["game_id"], game_dates[r["game_id"]], r["reason"])
+              for r in review_rows]
+    conn = conn_factory()
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, "insert into player_review_queue "
+                                "(player_id, player_name_display, team_code, first_game_id, first_game_date, reason) "
+                                "values %s on conflict (player_id) do nothing", values)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# --------------------------- one date ---------------------------
+
+def process_date(conn, d, season, prior_season):
+    """Ingest every completed, scheduled game on date `d` that has no score yet.
+    Returns (games_ingested, failures)."""
+    events = fetch_scoreboard(d)
+    plan, playoff_events, failures = [], [], []
+    for e in events:
+        if not e["final"]:
+            print(f"  skip {e['away']} @ {e['home']}: not final")
+            continue
+        res = resolve_scheduled_game(conn, season, d, e["home"], e["away"])
+        if res:
+            game_id, done, note = res
+            if done:
+                print(f"  skip {e['away']} @ {e['home']}: already ingested ({game_id})")
+                continue
+            if note:
+                print(f"  NOTE {e['away']} @ {e['home']} {game_id}: {note}")
+            plan.append({**e, "game_id": game_id, "playoff": False})
+        elif e["season_type"] == 3:
+            existing = find_playoff_game(conn, season, d, e["home"], e["away"])
+            if existing and existing[1] is not None:
+                continue
+            if existing:
+                plan.append({**e, "game_id": existing[0], "playoff": True})
+            else:
+                playoff_events.append(e)
+        else:
+            print(f"  skip {e['away']} @ {e['home']}: not on the {season} schedule (preseason or other)")
+    if playoff_events:
+        ids = next_game_ids(conn, season, len(playoff_events), playoff=True)
+        plan += [{**e, "game_id": gid, "playoff": True} for e, gid in zip(playoff_events, ids)]
+    if not plan:
+        return 0, failures
+
+    all_skaters, all_goalies, all_advanced, all_games, all_team_stats, all_raw = [], [], [], [], [], []
+    for g in plan:
+        home_code, away_code, game_id = g["home"], g["away"], g["game_id"]
+        print(f"Scraping {away_code} @ {home_code} -> {game_id}")
+        try:
+            box = scrape_game_box(game_id, d, home_code, away_code)
+        except Exception as e:
+            print(f"  FAILED {game_id}: {e} (will be retried on the next run)")
+            failures.append((d, game_id))
+            continue
+        pp_pk = fetch_espn_pp_pk(g["event_id"])
+        if not pp_pk:
+            print(f"  WARNING {game_id}: ESPN PP/PK not found; PP/PK raw values left empty for this game")
+
+        all_games.append({
+            "game_id": game_id, "season": season, "date": d, "home_team": home_code, "away_team": away_code,
+            "playoff": g["playoff"], "home_goals": box["home_goals"], "away_goals": box["away_goals"],
+        })
+        all_skaters += box["skaters"]
+        all_goalies += box["goalies"]
+        all_advanced += box["advanced"]
+
+        for team_code, is_home in ((home_code, True), (away_code, False)):
+            starting_goalie = next(
+                (gl["player_id"] for gl in box["goalies"]
+                 if gl["team_code"] == team_code and gl.get("toi_seconds")
+                 and gl["toi_seconds"] == max(
+                     (gg["toi_seconds"] or 0) for gg in box["goalies"] if gg["team_code"] == team_code)),
+                None,
+            )
+            team_total = box["team_totals"].get(team_code, {})
+            all_team_stats.append(compute_team_game_stats_row(
+                conn, game_id, d, season, prior_season, team_code, is_home,
+                box["attendance"], starting_goalie, team_total.get("cf"), team_total.get("ca"), pp_pk,
+            ))
+            pp = pp_pk.get(team_code, {})
+            all_raw.append({
+                "game_id": game_id, "team_code": team_code,
+                "cf_raw": team_total.get("cf"), "ca_raw": team_total.get("ca"),
+                "pp_goals_raw": pp.get("pp_goals"), "pp_opp_raw": pp.get("pp_opp"),
+                "pk_ga_raw": pp.get("pk_goals_against"), "pk_opp_raw": pp.get("pk_opp"),
+            })
+        time.sleep(REQUEST_DELAY_SECONDS)
+
+    if not all_games:
+        return 0, failures
+
+    # New players must exist before anything that references them.
+    names = {r["player_id"]: r.get("player_name_display") for r in all_skaters + all_goalies}
+    known = existing_player_ids(conn, list(names))
+    new_players = {pid: nm for pid, nm in names.items() if pid not in known}
+    insert_new_players(get_db_conn, new_players)
+
+    upsert(get_db_conn, "games", all_games, ["game_id"],
+           ["game_id", "season", "date", "home_team", "away_team", "playoff", "home_goals", "away_goals"])
+    upsert(get_db_conn, "team_game_stats", all_team_stats, ["game_id", "team_code"],
+           ["game_id", "team_code", "home", "attendance", "goalie", "corsi_for_pct",
+            "sv_pct_above_expected", "pp", "pk", "back_to_back"])
+    upsert(get_db_conn, "team_game_stats_raw", all_raw, ["game_id", "team_code"],
+           ["game_id", "team_code", "cf_raw", "ca_raw", "pp_goals_raw", "pp_opp_raw", "pk_ga_raw", "pk_opp_raw"])
+    upsert(get_db_conn, "player_game_appearances", all_skaters, ["game_id", "player_id"],
+           ["game_id", "player_id", "team_code", "goals", "assists", "points", "plus_minus", "pim",
+            "ev_goals", "pp_goals", "sh_goals", "gw_goals", "ev_assists", "pp_assists", "sh_assists",
+            "shots", "shot_pct", "shifts", "toi_seconds"])
+    upsert(get_db_conn, "goalie_game_appearances", all_goalies, ["game_id", "player_id"],
+           ["game_id", "player_id", "team_code", "decision", "goals_against", "shots_against",
+            "saves", "sv_pct", "shutout", "toi_seconds"])
+    upsert(get_db_conn, "player_advanced_game_appearances", all_advanced, ["game_id", "player_id"],
+           ["game_id", "player_id", "team_code", "icf", "sat_for", "sat_against", "cf_pct",
+            "crel_pct", "zone_start_off", "zone_start_def", "off_zone_start_pct", "hits", "blocks"])
+
+    review = players_needing_review(conn, season, prior_season, all_skaters, all_goalies, set(new_players))
+    report_review(get_db_conn, review, {g["game_id"]: g["date"] for g in all_games})
+    return len(all_games), failures
+
+
+# --------------------------- main ---------------------------
+
 def main():
-    yesterday = date.today() - timedelta(days=1)
-    print(f"NHL daily results ingest — DRY_RUN={DRY_RUN} — pulling games for {yesterday}")
+    today = et_today()
+    explicit = os.environ.get("INGEST_DATE")
+    print(f"NHL daily results ingest — DRY_RUN={DRY_RUN} — today (ET) {today}")
 
     if not os.environ.get("PGHOST"):
         print("No PGHOST set — nothing to do.")
         return
 
     conn = get_db_conn()
+    total, failures = 0, []
     try:
-        # Games for yesterday come from the ESPN scoreboard (home/away teams,
-        # final scores confirmed) — the actual per-player stats still come
-        # from Hockey-Reference box scores.
-        sb = requests.get(ESPN_SCOREBOARD_URL, params={"dates": yesterday.strftime("%Y%m%d")},
-                           headers=HEADERS, timeout=20).json()
-        todays_games = []
-        for ev in sb.get("events", []):
-            comp = (ev.get("competitions") or [{}])[0]
-            competitors = comp.get("competitors") or []
-            home = next((c for c in competitors if c.get("homeAway") == "home"), None)
-            away = next((c for c in competitors if c.get("homeAway") == "away"), None)
-            if not (home and away):
-                continue
-            home_code = normalize_team_code(home.get("team", {}).get("abbreviation", "").lower())
-            away_code = normalize_team_code(away.get("team", {}).get("abbreviation", "").lower())
-            todays_games.append((home_code, away_code))
+        if explicit:
+            dates = [date.fromisoformat(explicit)]
+        else:
+            yesterday = today - timedelta(days=1)
+            season_now = season_for_date(conn, yesterday)
+            dates = sorted(set(pending_dates(conn, season_now, today, LOOKBACK_DAYS)) | {yesterday})
+        print("Dates to process: " + ", ".join(str(x) for x in dates))
 
-        if not todays_games:
-            print("No games found for yesterday.")
-            return
+        for d in dates:
+            season = season_for_date(conn, d)
+            prior_season = prior_season_code(season)
+            print(f"== {d} (season {season}, prior {prior_season}) ==")
+            n, fails = process_date(conn, d, season, prior_season)
+            total += n
+            failures += fails
+            print(f"  {n} game(s) ingested for {d}")
 
-        season_code = "2526"  # TODO: derive from date once this spans a season boundary
-        prior_season_code = "2425"
-        game_ids = next_game_ids(conn, season_code, len(todays_games), playoff=False)
-
-        all_skaters, all_goalies, all_advanced, all_games, all_team_stats = [], [], [], [], []
-
-        for (home_code, away_code), game_id in zip(todays_games, game_ids):
-            print(f"Scraping {away_code} @ {home_code} -> {game_id}")
-            box = scrape_game_box(game_id, yesterday, home_code, away_code)
-            pp_pk = fetch_espn_pp_pk(yesterday, home_code, away_code)
-
-            all_games.append({
-                "game_id": game_id, "season": season_code, "date": yesterday,
-                "home_team": home_code, "away_team": away_code, "playoff": False,
-                "home_goals": box["home_goals"], "away_goals": box["away_goals"],
-            })
-            all_skaters += box["skaters"]
-            all_goalies += box["goalies"]
-            all_advanced += box["advanced"]
-
-            for team_code, is_home in ((home_code, True), (away_code, False)):
-                starting_goalie = next(
-                    (g["player_id"] for g in box["goalies"]
-                     if g["team_code"] == team_code and g.get("toi_seconds", 0)
-                     and g["toi_seconds"] == max(
-                         (gg["toi_seconds"] or 0) for gg in box["goalies"] if gg["team_code"] == team_code)),
-                    None,
-                )
-                team_total = box["team_totals"].get(team_code, {})
-                row = compute_team_game_stats_row(
-                    conn, game_id, yesterday, season_code, prior_season_code, team_code, is_home,
-                    box["attendance"], starting_goalie,
-                    team_total.get("cf"), team_total.get("ca"), pp_pk,
-                )
-                all_team_stats.append(row)
-
-            time.sleep(REQUEST_DELAY_SECONDS)
-
-        upsert(get_db_conn, "games", all_games, ["game_id"],
-               ["game_id", "season", "date", "home_team", "away_team", "playoff", "home_goals", "away_goals"])
-        upsert(get_db_conn, "team_game_stats", all_team_stats, ["game_id", "team_code"],
-               ["game_id", "team_code", "home", "attendance", "goalie", "corsi_for_pct",
-                "sv_pct_above_expected", "pp", "pk", "back_to_back"])
-        upsert(get_db_conn, "player_game_appearances", all_skaters, ["game_id", "player_id"],
-               ["game_id", "player_id", "team_code", "goals", "assists", "points", "plus_minus", "pim",
-                "ev_goals", "pp_goals", "sh_goals", "gw_goals", "ev_assists", "pp_assists", "sh_assists",
-                "shots", "shot_pct", "shifts", "toi_seconds"])
-        upsert(get_db_conn, "goalie_game_appearances", all_goalies, ["game_id", "player_id"],
-               ["game_id", "player_id", "team_code", "decision", "goals_against", "shots_against",
-                "saves", "sv_pct", "shutout", "toi_seconds"])
-        upsert(get_db_conn, "player_advanced_game_appearances", all_advanced, ["game_id", "player_id"],
-               ["game_id", "player_id", "team_code", "icf", "sat_for", "sat_against", "cf_pct",
-                "crel_pct", "zone_start_off", "zone_start_def", "off_zone_start_pct", "hits", "blocks"])
-
-        if not DRY_RUN:
+        if total and not DRY_RUN:
             refresh_materialized_views(get_db_conn)
-
     finally:
         conn.close()
 
+    if failures:
+        print("WARNING - games that could not be ingested (retried automatically while inside the lookback window):")
+        for d, gid in failures:
+            print(f"  {d} {gid}")
+        if any(d <= today - timedelta(days=2) for d, _ in failures):
+            print("A failure is more than 2 days old - exiting with an error so it is not missed.")
+            raise SystemExit(1)
     print("Done.")
 
 
