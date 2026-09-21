@@ -187,7 +187,14 @@ ESPN_TEAM_CODE_MAP_REVERSE = dict(ESPN_TO_INTERNAL)
 
 def get_db_conn():
     if os.environ.get("PGHOST"):
-        return psycopg2.connect()
+        try:
+            return psycopg2.connect(connect_timeout=20)
+        except psycopg2.OperationalError as e:
+            print(f"DATABASE CONNECTION FAILED (host={os.environ.get('PGHOST')!r}, port={os.environ.get('PGPORT')!r}, "
+                  f"user={os.environ.get('PGUSER')!r}): {e}")
+            print("Hint: Supabase's direct host (db.<ref>.supabase.co) is IPv6-only, which GitHub's runners can't "
+                  "reach; use the pooler host from Supabase > Connect instead.")
+            raise
     raise RuntimeError("Set PGHOST/PGUSER/PGPASSWORD/PGDATABASE/PGPORT.")
 
 
@@ -743,7 +750,11 @@ def parse_scoreboard_events(sb):
 
 def fetch_scoreboard(d):
     r = requests.get(ESPN_SCOREBOARD_URL, params={"dates": d.strftime("%Y%m%d")}, headers=HEADERS, timeout=20)
-    r.raise_for_status()
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"ESPN scoreboard returned HTTP {r.status_code} (server={r.headers.get('server')!r}) for {d}. "
+            f"First 200 chars: {r.text[:200]!r}. If this is 403 'Access Denied' the run is being blocked "
+            "from GitHub's servers.")
     return parse_scoreboard_events(r.json())
 
 
@@ -892,7 +903,7 @@ def process_date(conn, d, season, prior_season):
             else:
                 playoff_events.append(e)
         else:
-            print(f"  skip {e['away']} @ {e['home']}: not on the {season} schedule (preseason or other)")
+            print(f"  skip {e['away']} @ {e['home']}: not on the regular-season schedule (preseason or other)")
     if playoff_events:
         ids = next_game_ids(conn, season, len(playoff_events), playoff=True)
         plan += [{**e, "game_id": gid, "playoff": True} for e, gid in zip(playoff_events, ids)]
