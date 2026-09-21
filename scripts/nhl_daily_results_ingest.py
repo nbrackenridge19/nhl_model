@@ -63,18 +63,14 @@ gamelog2526.xlsm's ALL sheet and per-team tabs (e.g. 'CHI'):
   games accumulate) — see league_avg_sv_pct_today() below, traced from the
   ALL sheet's SSvPct LET-formula.
 
-STILL UNCERTAIN — VERIFY BEFORE TRUSTING LIVE
+PP / PK SOURCE
 --------------------------------------------------------------------------
 Team-level PP goals/opportunities and PK goals-against/opportunities-
-against (MUGF/MUOF/MDGA/MDOA in the original workbook) are NOT visible on
-the Hockey-Reference box score page itself. This script pulls them from
-ESPN's game summary endpoint (same event_id nhlodds.py already resolves
-for odds), on the theory that ESPN's boxscore JSON exposes
-'powerPlayGoals'/'powerPlayOpportunities' per team. THIS HAS NOT BEEN
-CONFIRMED AGAINST A REAL COMPLETED GAME — the very first live run of this
-script should be spot-checked: pull one completed game, compare the
-computed PP/PK team_game_stats values against what you'd expect, before
-trusting it for actual betting decisions.
+against (MUGF/MUOF/MDGA/MDOA in the original workbook) are NOT on the
+Hockey-Reference box score page. They come from NHL.com's gamecenter feed
+(api-web.nhle.com, the 'powerPlay' team stat, written "goals/opportunities").
+Checked on 14 completed preseason games: NHL.com's numbers matched ESPN's on
+every team. ESPN is not used because it answers 403 to GitHub's servers.
 
 corsi_for_pct's raw CF/CA inputs ARE confirmed, against the actual
 recorded values in gamelog2526.xlsm during the Project 3 backfill
@@ -105,9 +101,10 @@ SEASON ROLLOVER CHANGES (2026-27) — see chat for the reasoning behind each
    foreign key used to make the whole upsert fail), and any skater without a
    prior-season/rookie row (or goalie without career priors) is written to
    player_review_queue and printed as ACTION NEEDED.
-7. ESPN abbreviations (tb, sj, nj, la, vgk) are converted to our team codes.
+7. The game list, preseason flag and PP/PK now come from NHL.com's API (ESPN blocks
+   GitHub's servers). NHL abbreviations (only VGK differs) are converted to our team codes.
 8. Preseason and other non-schedule games are skipped (they never match a
-   schedule row). Playoffs are handled only if ESPN marks them season type 3.
+   schedule row). Playoffs are handled only if NHL.com marks them game type 3.
 9. Refresh chain fixed: it now includes v_team_game_perspective (without it
    new games never reached the bet/result views). The v2/v4 experiment chain
    is refreshed only when REFRESH_EXPERIMENTAL=true. Each view is refreshed
@@ -136,8 +133,9 @@ DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
 REQUEST_DELAY_SECONDS = float(os.environ.get("REQUEST_DELAY_SECONDS", "3"))
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 BOXSCORE_URL = "https://www.hockey-reference.com/boxscores/{code}.html"
-ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard"
-ESPN_SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/summary"
+NHL_SCORE_URL = "https://api-web.nhle.com/v1/score/{d}"
+NHL_RIGHT_RAIL_URL = "https://api-web.nhle.com/v1/gamecenter/{gid}/right-rail"
+NHL_BOXSCORE_URL = "https://api-web.nhle.com/v1/gamecenter/{gid}/boxscore"
 
 # Read from gamelog2526.xlsm ALL!Z2:Z7 this session — refit once per
 # season. Re-pull from the current season's gamelog workbook if this
@@ -174,16 +172,9 @@ def regression_constants(season):
 BLEND_GAME_THRESHOLD = 40  # games after which the blend is pure season-to-date
 GOALIE_SHOTS_FLOOR = 1050  # min(shots) denominator floor in the SvPctR blend
 
-# ESPN abbreviation -> our team_code (only the ones that differ).
-ESPN_TO_INTERNAL = {"tb": "tbl", "sj": "sjs", "nj": "njd", "la": "lak", "vgk": "veg", "was": "wsh", "utah": "uta"}
-
-# ESPN uses different abbreviations than our internal team_code for these 5
-# teams (confirmed via live ESPN pages during the Project 3 backfill spot
-# check) — every other team's ESPN abbreviation matches our team_code
-# exactly. Used only for the ESPN PP/PK lookup below.
-ESPN_TEAM_CODE_MAP = {"tbl": "tb", "sjs": "sj", "njd": "nj", "lak": "la", "veg": "vgk"}
-ESPN_TEAM_CODE_MAP_REVERSE = dict(ESPN_TO_INTERNAL)
-
+# NHL.com abbreviation (lower case) -> our team_code. Only VGK differs from ours; the rest
+# are kept in case another feed's abbreviations ever come through.
+FEED_TO_INTERNAL = {"tb": "tbl", "sj": "sjs", "nj": "njd", "la": "lak", "vgk": "veg", "was": "wsh", "utah": "uta"}
 
 def get_db_conn():
     if os.environ.get("PGHOST"):
@@ -199,8 +190,8 @@ def get_db_conn():
 
 
 def normalize_team_code(code):
-    """ESPN abbreviation -> our team_code."""
-    return ESPN_TO_INTERNAL.get(code, code)
+    """Feed abbreviation (lower case) -> our team_code."""
+    return FEED_TO_INTERNAL.get(code, code)
 
 
 def normalize_player_name(raw):
@@ -450,38 +441,53 @@ def parse_team_cf_ca_5v5(table):
     return parse_int(row.get("on_Cevents")), parse_int(row.get("on_opp_Cevents"))
 
 
-# --------------------------- ESPN PP/PK lookup (UNCONFIRMED — see docstring) ---------------------------
+# --------------------------- PP/PK lookup (NHL.com) ---------------------------
 
-def fetch_espn_pp_pk(event_id):
-    """Returns {team_code: {'pp_goals':, 'pp_opp':, 'pk_goals_against':, 'pk_opp':}}
-    or {} if not found. Field names UNCONFIRMED against a real completed game —
-    verify with nhl_diagnose_espn_pp_pk.py (see module docstring)."""
-    if event_id is None:
-        return {}
+def find_category(obj, category):
+    """Recursively find dicts like {'category': 'powerPlay', 'awayValue': '1/3', 'homeValue': '0/2'}."""
+    found = []
+    if isinstance(obj, dict):
+        if obj.get("category") == category:
+            found.append(obj)
+        for v in obj.values():
+            found += find_category(v, category)
+    elif isinstance(obj, list):
+        for v in obj:
+            found += find_category(v, category)
+    return found
+
+
+def parse_goals_over_opps(value):
+    """'1/6' -> (1, 6); None if it cannot be read."""
     try:
-        summary = requests.get(ESPN_SUMMARY_URL, params={"event": event_id}, headers=HEADERS, timeout=20).json()
-    except Exception:
-        return {}
-    result = {}
-    for team_block in summary.get("boxscore", {}).get("teams", []):
-        espn_abbr = team_block.get("team", {}).get("abbreviation", "").lower()
-        abbr = ESPN_TEAM_CODE_MAP_REVERSE.get(espn_abbr, espn_abbr)
-        stats = {s.get("name"): s.get("displayValue") for s in team_block.get("statistics", [])}
-        pp = stats.get("powerPlayGoals") or stats.get("powerPlayConversion", "0-0")
-        if "-" in str(pp):
-            goals, opp = str(pp).split("-")
-        else:
-            goals, opp = stats.get("powerPlayGoals"), stats.get("powerPlayOpportunities")
-        result[abbr] = {"pp_goals": parse_int(goals), "pp_opp": parse_int(opp)}
-    # PK for a team = opponent's PP against them: pk_opp/pk_goals_against are the OTHER team's pp_opp/pp_goals
-    teams = list(result.keys())
-    if len(teams) == 2:
-        a, b = teams
-        result[a]["pk_opp"] = result[b]["pp_opp"]
-        result[a]["pk_goals_against"] = result[b]["pp_goals"]
-        result[b]["pk_opp"] = result[a]["pp_opp"]
-        result[b]["pk_goals_against"] = result[a]["pp_goals"]
-    return result
+        g, o = str(value).split("/")
+        return int(g), int(o)
+    except (ValueError, TypeError):
+        return None
+
+
+def fetch_pp_pk(game_id, home_team, away_team):
+    """Returns {team_code: {'pp_goals':, 'pp_opp':, 'pk_goals_against':, 'pk_opp':}} or {} if not found.
+    A team's PK numbers are its opponent's PP numbers."""
+    for url in (NHL_RIGHT_RAIL_URL.format(gid=game_id), NHL_BOXSCORE_URL.format(gid=game_id)):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            if r.status_code != 200:
+                continue
+            cats = find_category(r.json(), "powerPlay")
+        except Exception:
+            continue
+        if not cats:
+            continue
+        home = parse_goals_over_opps(cats[0].get("homeValue"))
+        away = parse_goals_over_opps(cats[0].get("awayValue"))
+        if home is None or away is None:
+            continue
+        return {
+            home_team: {"pp_goals": home[0], "pp_opp": home[1], "pk_goals_against": away[0], "pk_opp": away[1]},
+            away_team: {"pp_goals": away[0], "pp_opp": away[1], "pk_goals_against": home[0], "pk_opp": home[1]},
+        }
+    return {}
 
 
 # --------------------------- trailing blend computations ---------------------------
@@ -553,7 +559,7 @@ def league_avg_sv_pct_today(conn, season, before_date, prior_two_season_avg):
 
 
 def compute_team_game_stats_row(conn, game_id, game_date, season, prior_season, team_code, is_home,
-                                 attendance, starting_goalie_id, cf_today, ca_today, pp_pk_espn):
+                                 attendance, starting_goalie_id, cf_today, ca_today, pp_pk):
     n = games_played_before(conn, team_code, season, game_date)
     rc = regression_constants(season)
     with conn.cursor() as cur:
@@ -568,7 +574,7 @@ def compute_team_game_stats_row(conn, game_id, game_date, season, prior_season, 
     cf_pred = rc["cf_int"] + rc["cf_pycf"] * prior_cf
     corsi_for_pct = blended_rate(n, cf_pred, cf_td, cf_td + ca_td)
 
-    pp_stats = pp_pk_espn.get(team_code, {})
+    pp_stats = pp_pk.get(team_code, {})
     prior_pp = prior_season_value(conn, team_code, prior_season, "pp") or 0.2
     pp_pred = rc["pp_int"] + rc["pp_pypp"] * prior_pp
     with conn.cursor() as cur:
@@ -726,36 +732,37 @@ def pending_dates(conn, season, today, lookback_days):
         return [r[0] for r in cur.fetchall()]
 
 
-def parse_scoreboard_events(sb):
-    """ESPN scoreboard JSON -> list of {event_id, home, away, final, season_type} (our team codes)."""
+def parse_nhl_score_events(js):
+    """NHL.com score feed -> list of {event_id, home, away, final, season_type} (our team codes).
+    season_type: 1 preseason, 2 regular season, 3 playoffs (NHL gameType)."""
+    games = js.get("games", []) or []
+    if games and not any("gameState" in g for g in games):
+        raise RuntimeError("NHL.com score feed has no 'gameState' field; keys seen: "
+                           + ", ".join(sorted(games[0].keys())))
     out = []
-    for ev in sb.get("events", []) or []:
-        comp = (ev.get("competitions") or [{}])[0]
-        competitors = comp.get("competitors") or []
-        home = next((c for c in competitors if c.get("homeAway") == "home"), None)
-        away = next((c for c in competitors if c.get("homeAway") == "away"), None)
-        if not (home and away):
+    for g in games:
+        home, away = g.get("homeTeam") or {}, g.get("awayTeam") or {}
+        if not (home.get("abbrev") and away.get("abbrev")):
             continue
-        st = (ev.get("status") or {}).get("type") or {}
-        final = bool(st.get("completed")) or st.get("state") == "post" or "FINAL" in str(st.get("name", "")).upper()
+        gid = g.get("id")
+        gtype = g.get("gameType")
+        if gtype is None and gid:
+            gtype = int(str(gid)[4:6])
         out.append({
-            "event_id": ev.get("id"),
-            "home": normalize_team_code(str(home.get("team", {}).get("abbreviation", "")).lower()),
-            "away": normalize_team_code(str(away.get("team", {}).get("abbreviation", "")).lower()),
-            "final": final,
-            "season_type": (ev.get("season") or {}).get("type"),
+            "event_id": gid,
+            "home": normalize_team_code(str(home["abbrev"]).lower()),
+            "away": normalize_team_code(str(away["abbrev"]).lower()),
+            "final": str(g.get("gameState", "")).upper() in ("OFF", "FINAL"),
+            "season_type": gtype,
         })
     return out
 
 
 def fetch_scoreboard(d):
-    r = requests.get(ESPN_SCOREBOARD_URL, params={"dates": d.strftime("%Y%m%d")}, headers=HEADERS, timeout=20)
+    r = requests.get(NHL_SCORE_URL.format(d=d.isoformat()), headers=HEADERS, timeout=20)
     if r.status_code != 200:
-        raise RuntimeError(
-            f"ESPN scoreboard returned HTTP {r.status_code} (server={r.headers.get('server')!r}) for {d}. "
-            f"First 200 chars: {r.text[:200]!r}. If this is 403 'Access Denied' the run is being blocked "
-            "from GitHub's servers.")
-    return parse_scoreboard_events(r.json())
+        raise RuntimeError(f"NHL.com score feed returned HTTP {r.status_code} for {d}. First 200 chars: {r.text[:200]!r}")
+    return parse_nhl_score_events(r.json())
 
 
 def resolve_scheduled_game(conn, season, game_date, home, away):
@@ -920,9 +927,9 @@ def process_date(conn, d, season, prior_season):
             print(f"  FAILED {game_id}: {e} (will be retried on the next run)")
             failures.append((d, game_id))
             continue
-        pp_pk = fetch_espn_pp_pk(g["event_id"])
+        pp_pk = fetch_pp_pk(g["event_id"], home_code, away_code)
         if not pp_pk:
-            print(f"  WARNING {game_id}: ESPN PP/PK not found; PP/PK raw values left empty for this game")
+            print(f"  WARNING {game_id}: NHL.com PP/PK not found; PP/PK raw values left empty for this game")
 
         all_games.append({
             "game_id": game_id, "season": season, "date": d, "home_team": home_code, "away_team": away_code,
