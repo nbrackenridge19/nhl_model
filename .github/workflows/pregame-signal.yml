@@ -1,0 +1,41 @@
+name: NHL Pregame Bet Signal
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'  # every 10 minutes -- picks up new odds/snapshot combos as soon as they're ready
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (true = no DB writes)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests psycopg2-binary beautifulsoup4
+
+      - name: Run pregame signal
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGPORT: ${{ secrets.PGPORT }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+        run: python scripts/nhl_pregame_signal.py
