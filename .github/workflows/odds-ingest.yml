@@ -37,5 +37,5 @@ jobs:
           PGPASSWORD: ${{ secrets.PGPASSWORD }}
           PGDATABASE: ${{ secrets.PGDATABASE }}
           PGPORT: ${{ secrets.PGPORT }}
-          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: python scripts/nhl_odds_ingest.py
