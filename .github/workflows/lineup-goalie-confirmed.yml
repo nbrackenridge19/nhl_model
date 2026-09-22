@@ -1,0 +1,44 @@
+name: NHL Lineup & Goalie Ingest — Confirmed (end of night)
+
+on:
+  schedule:
+    # 04:00 UTC = 11pm ET (EST) / 12am ET (EDT) -- always at or after 11pm ET, i.e. after every NHL
+    # game's start on a normal schedule (the latest starts, West Coast games, go off ~10-10:30pm ET).
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (true = no DB writes)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests psycopg2-binary
+
+      - name: Run end-of-night confirmed capture
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGPORT: ${{ secrets.PGPORT }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+          RUN_MODE: confirmed
+        run: python scripts/nhl_lineup_goalie_ingest.py

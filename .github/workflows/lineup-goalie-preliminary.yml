@@ -1,0 +1,42 @@
+name: NHL Lineup & Goalie Ingest — Preliminary
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # every 30 minutes
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (true = no DB writes)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests psycopg2-binary
+
+      - name: Run preliminary lineup/goalie capture
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGPORT: ${{ secrets.PGPORT }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+          RUN_MODE: preliminary
+        run: python scripts/nhl_lineup_goalie_ingest.py
