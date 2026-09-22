@@ -2,46 +2,61 @@
 nhl_lineup_goalie_ingest.py -- captures projected lineups and starting goalies
 from DailyFaceoff into lineup_snapshots / goalie_snapshots, and queues any
 player it can't confidently match into player_id_review_queue instead of
-guessing. Meant to run every 30 minutes via GitHub Actions
-(lineup-goalie-ingest.yml).
+guessing.
 
-WHY 'preliminary' VS 'confirmed' (matches the existing snapshot_type check
-constraint)
+This script runs in one of two modes, set by the RUN_MODE env var, each on
+its own GitHub Actions schedule:
+
+  RUN_MODE=preliminary  (lineup-goalie-preliminary.yml, every 30 minutes)
+    The first time this script sees a (game_id, team_code) with no
+    'preliminary' row yet, it writes whatever DailyFaceoff shows, however
+    far out that is. Never overwritten by this script.
+
+  RUN_MODE=confirmed  (lineup-goalie-confirmed.yml, once nightly)
+    A single end-of-night pass, scheduled for after every one of that day's
+    games has started (Nick: "we should be running one, end of night
+    dailyfaceoff check once all games have started ... that's the definitive
+    proof" -- by then DailyFaceoff's goalie/line pages reflect who is
+    actually playing, not a projection). Scheduled for 04:00 UTC, which is
+    11pm-12am ET depending on DST -- always at or after 11pm ET, which is
+    after every NHL game's start on a normal schedule (the latest starts,
+    West Coast games, go off around 10-10:30pm ET). For every game whose
+    date is "today" in US/Eastern (computed with zoneinfo, not the runner's
+    UTC clock) and has no 'confirmed' row yet, writes whatever DailyFaceoff
+    shows as 'confirmed' -- no per-game start-time check, since the whole
+    point of the nightly timing is that every game already qualifies.
+
+CONFIRMED ROWS AND POST-GAME CORRECTION
 --------------------------------------------------------------------------
-- 'preliminary': the first time this script sees a (game_id, team_code) with
-  no 'preliminary' row yet, it writes whatever DailyFaceoff shows, however
-  far out that is. Never overwritten.
-- 'confirmed': once the game's scheduled start time has passed (not a window
-  before it -- Nick: "it should be at game start time"), the next run writes
-  whatever DailyFaceoff shows as 'confirmed'. Game start times come from
-  ESPN's site.web.api scoreboard (same source nhl_odds_ingest.py uses),
-  since our `games` table only stores a date, not a time. Because this
-  script runs every 30 minutes, "confirmed" in practice lands up to ~30
-  minutes after puck drop, not before it.
-- Unlike 'preliminary', a 'confirmed' row IS later overwritten -- but only by
+- lineup_snapshots' 'confirmed' row IS later overwritten -- but only by
   nhl_daily_results_ingest.py, once it knows who actually played (see that
   script's overwrite_confirmed_snapshots()). That result is definitive, so it
-  replaces whatever DailyFaceoff projected: players DailyFaceoff listed who
+  replaces whatever DailyFaceoff projected: skaters DailyFaceoff listed who
   did not actually dress are removed, and anyone who played but wasn't
   projected (a call-up, a last-second swap) is added. This script itself
   never touches an existing 'confirmed' row.
+- goalie_snapshots' 'confirmed' row is NEVER overwritten by the results
+  ingest. Nick: a box score cannot reliably tell you who started -- a
+  starter who gets pulled can end up with less ice time than the goalie who
+  relieves him, and Hockey-Reference's listing order is not a safe proxy
+  either. The nightly DailyFaceoff capture (this script, RUN_MODE=confirmed)
+  is goalie_snapshots' only and final word, and nhl_daily_results_ingest.py
+  reads it back (rather than deriving anything from the box score) for the
+  SvPctR feature's starting-goalie identity.
   Side effect worth knowing: v_lineup_fallback_status's "used_fallback" flag
-  (no confirmed row before the game) stops being a reliable historical record
-  of pre-game data quality once this post-game overwrite always adds a
-  confirmed row -- it will read false after the fact even for a game whose
-  real pre-game 'confirmed' capture failed. Flagging this; not changing the
-  view without a separate decision.
+  (no confirmed row before the game) stops being a reliable historical
+  record of pre-game LINEUP data quality once the post-game overwrite always
+  adds a confirmed row -- it will read false after the fact even for a game
+  whose real pre-game 'confirmed' capture failed. (v_goalie_fallback_status
+  is unaffected, since goalie_snapshots is never overwritten.) Flagging
+  this; not changing the view without a separate decision.
 
 DFO_STATUS COLUMN (goalie_snapshots only)
 --------------------------------------------------------------------------
 DailyFaceoff's own confidence label (homeNewsStrengthName / away...) for the
-starting goalie -- e.g. 'Confirmed' -- is stored verbatim in the new
-goalie_snapshots.dfo_status column. It is informational only: the
-preliminary/confirmed split above still runs on capture timing, not on this
-label, since only "Confirmed" was ever observed and its full set of values
-hasn't been.
+starting goalie -- e.g. 'Confirmed' -- is stored verbatim in the
+goalie_snapshots.dfo_status column. Informational only.
 
-PLAYER MATCHING
 PLAYER MATCHING (this is the "prompts him" workflow Nick asked for)
 --------------------------------------------------------------------------
 For every skater DailyFaceoff lists in a team's 12 forwards / 6 defensemen
@@ -65,9 +80,14 @@ entirely, matching "roster boolean" = presence in the table.
 SAFETY
 --------------------------------------------------------------------------
 - DRY_RUN defaults to true.
-- Never overwrites an existing snapshot row of either type.
-- Only looks at games within LOOKAHEAD_DAYS (default 2) and regular-season
-  games (DailyFaceoff doesn't cover preseason -- confirmed 2026-09-19/20).
+- Never overwrites an existing snapshot row of either type (this script
+  never touches an existing 'preliminary' or 'confirmed' row -- only
+  nhl_daily_results_ingest.py's lineup overwrite does, and only for skaters).
+- RUN_MODE is required; the script exits with an error rather than guessing
+  which pass to run.
+- Preliminary looks at games within LOOKAHEAD_DAYS (default 2) and
+  regular-season games only (DailyFaceoff doesn't cover preseason --
+  confirmed 2026-09-19/20). Confirmed looks only at "today" (US/Eastern).
 """
 
 import os
@@ -82,14 +102,15 @@ import requests
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
 LOOKAHEAD_DAYS = int(os.environ.get("LOOKAHEAD_DAYS", "2"))
-# 'confirmed' triggers once the game's start time has passed -- no minutes-before window (see docstring).
 REQUEST_DELAY_SECONDS = 1.0
+RUN_MODE = os.environ.get("RUN_MODE", "").strip().lower()
+if RUN_MODE not in ("preliminary", "confirmed"):
+    raise SystemExit(f"RUN_MODE must be 'preliminary' or 'confirmed', got {RUN_MODE!r}.")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
 }
-SCOREBOARD_URL = "https://site.web.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard"
 DFO_LINES_URL = "https://www.dailyfaceoff.com/teams/{slug}/line-combinations"
 DFO_GOALIES_URL = "https://www.dailyfaceoff.com/starting-goalies/{d}"
 
@@ -136,6 +157,14 @@ def pos_group(group_identifier):
     if g.startswith("f"):
         return "F"
     return None
+
+
+def et_today():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).date()
+    except Exception:
+        return (datetime.now(timezone.utc) - timedelta(hours=5)).date()
 
 
 def get_db_conn():
@@ -210,9 +239,10 @@ def fetch_goalies_for_date(d):
     return out, None
 
 
-# --------------------------- schedule / ESPN start-time helpers ---------------------------
+# --------------------------- schedule helpers ---------------------------
 
 def upcoming_games_for_team(conn, team_code, today, lookahead_days):
+    """Nearest unplayed game for a team within [today, today+lookahead_days] -- used by the preliminary pass."""
     with conn.cursor() as cur:
         cur.execute(
             "select game_id, date, home_team, away_team from games where playoff = false and home_goals is null "
@@ -221,27 +251,21 @@ def upcoming_games_for_team(conn, team_code, today, lookahead_days):
         return cur.fetchone()
 
 
-def fetch_start_times(dates):
-    """{(home, away): start_datetime_utc} across the given dates, via ESPN's unblocked scoreboard mirror."""
-    out = {}
-    for d in dates:
-        r = requests.get(SCOREBOARD_URL, params={"dates": d.strftime("%Y%m%d")}, headers=HEADERS, timeout=20)
-        if r.status_code != 200:
-            print(f"  WARNING: start-time lookup failed for {d}: HTTP {r.status_code}")
-            continue
-        for ev in r.json().get("events", []) or []:
-            comp = (ev.get("competitions") or [{}])[0]
-            comps = comp.get("competitors") or []
-            home = next((c for c in comps if c.get("homeAway") == "home"), {})
-            away = next((c for c in comps if c.get("homeAway") == "away"), {})
-            h = normalize_team_code(str((home.get("team") or {}).get("abbreviation", "")).lower())
-            a = normalize_team_code(str((away.get("team") or {}).get("abbreviation", "")).lower())
-            try:
-                out[(h, a)] = datetime.strptime(ev["date"], "%Y-%m-%dT%H:%MZ").replace(tzinfo=timezone.utc)
-            except (KeyError, TypeError, ValueError):
-                continue
-        time.sleep(REQUEST_DELAY_SECONDS)
-    return out
+def game_today_for_team(conn, team_code, today):
+    """This team's game today specifically (or None if it isn't playing today) -- used by the confirmed pass."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "select game_id, date, home_team, away_team from games where playoff = false and date = %s "
+            "and (home_team = %s or away_team = %s)", (today, team_code, team_code))
+        return cur.fetchone()
+
+
+def resolve_game_id(conn, d, home, away):
+    with conn.cursor() as cur:
+        cur.execute("select game_id from games where playoff = false and date = %s and home_team = %s "
+                    "and away_team = %s", (d, home, away))
+        row = cur.fetchone()
+    return row[0] if row else None
 
 
 # --------------------------- player matching + review queue ---------------------------
@@ -321,15 +345,24 @@ def write_review_queue(conn_factory, rows):
 
 # --------------------------- lineups ---------------------------
 
-def lineup_snapshot_pass(conn, today, start_times, queue_rows):
-    print("== lineup snapshots ==")
+def lineup_snapshot_pass(conn, today, queue_rows):
+    print(f"== lineup snapshots ({RUN_MODE}) ==")
     already_queued = open_review_dfo_ids(conn, "dailyfaceoff_lines")
     rows = []
     for slug, expected_code in TEAM_SLUGS.items():
-        game = upcoming_games_for_team(conn, expected_code, today, LOOKAHEAD_DAYS)
+        if RUN_MODE == "preliminary":
+            game = upcoming_games_for_team(conn, expected_code, today, LOOKAHEAD_DAYS)
+        else:
+            game = game_today_for_team(conn, expected_code, today)
         if game is None:
             continue
         game_id, gdate, home, away = game
+        with conn.cursor() as cur:
+            cur.execute("select distinct snapshot_type from lineup_snapshots where game_id = %s and team_code = %s",
+                        (game_id, expected_code))
+            have = {r[0] for r in cur.fetchall()}
+        if RUN_MODE in have:  # this pass's type ('preliminary' or 'confirmed') already written
+            continue
         team_code, players, err = fetch_team_lines(slug)
         if err:
             print(f"  {expected_code} ({slug}): FAILED ({err})")
@@ -337,49 +370,27 @@ def lineup_snapshot_pass(conn, today, start_times, queue_rows):
             continue
         if team_code != expected_code:
             print(f"  WARNING {slug}: DailyFaceoff teamAbbreviation resolved to {team_code!r}, expected {expected_code!r}")
-        with conn.cursor() as cur:
-            cur.execute("select distinct snapshot_type from lineup_snapshots where game_id = %s and team_code = %s",
-                        (game_id, expected_code))
-            have = {r[0] for r in cur.fetchall()}
-        start = start_times.get((home, away))
-        in_confirmed_window = start is not None and datetime.now(timezone.utc) >= start
-        want_types = ([] if "preliminary" in have else ["preliminary"]) + \
-                     ([] if "confirmed" in have or not in_confirmed_window else ["confirmed"])
-        if not want_types:
-            print(f"  {expected_code}: {game_id} already has both snapshots, skipping")
-            time.sleep(REQUEST_DELAY_SECONDS)
-            continue
         resolved = []
         for p in players:
             pid = resolve_player(conn, "dailyfaceoff_lines", p["name"], p["dfo_player_id"], expected_code,
                                  p["pos_group"], game_id, already_queued, queue_rows)
             if pid:
                 resolved.append(pid)
-        print(f"  {expected_code} -> {game_id}: {len(resolved)}/{len(players)} matched, writing {want_types}")
+        print(f"  {expected_code} -> {game_id}: {len(resolved)}/{len(players)} matched, writing {RUN_MODE}")
         now = datetime.now(timezone.utc)
-        for t in want_types:
-            for pid in resolved:
-                rows.append((game_id, expected_code, pid, t, now))
+        rows += [(game_id, expected_code, pid, RUN_MODE, now) for pid in resolved]
         time.sleep(REQUEST_DELAY_SECONDS)
     return rows
 
 
 # --------------------------- goalies ---------------------------
 
-def resolve_game_id(conn, d, home, away):
-    with conn.cursor() as cur:
-        cur.execute("select game_id from games where playoff = false and date = %s and home_team = %s "
-                    "and away_team = %s", (d, home, away))
-        row = cur.fetchone()
-    return row[0] if row else None
-
-
-def goalie_snapshot_pass(conn, today, start_times, queue_rows):
-    print("== goalie snapshots ==")
+def goalie_snapshot_pass(conn, today, queue_rows):
+    print(f"== goalie snapshots ({RUN_MODE}) ==")
     already_queued = open_review_dfo_ids(conn, "dailyfaceoff_goalies")
     rows = []
-    for i in range(LOOKAHEAD_DAYS + 1):
-        d = today + timedelta(days=i)
+    dates = [today + timedelta(days=i) for i in range(LOOKAHEAD_DAYS + 1)] if RUN_MODE == "preliminary" else [today]
+    for d in dates:
         games, err = fetch_goalies_for_date(d)
         if err:
             print(f"  {d}: FAILED ({err})")
@@ -397,8 +408,6 @@ def goalie_snapshot_pass(conn, today, start_times, queue_rows):
             if game_id is None:
                 print(f"  {g['away']} @ {g['home']} ({d}): not on the schedule")
                 continue
-            start = start_times.get((g["home"], g["away"]))
-            in_confirmed_window = start is not None and datetime.now(timezone.utc) >= start
             for team_code, gl in ((g["home"], g["home_goalie"]), (g["away"], g["away_goalie"])):
                 if gl is None:
                     print(f"  {team_code} ({game_id}): no goalie listed yet")
@@ -407,18 +416,16 @@ def goalie_snapshot_pass(conn, today, start_times, queue_rows):
                     cur.execute("select distinct snapshot_type from goalie_snapshots where game_id = %s and team_code = %s",
                                 (game_id, team_code))
                     have = {r[0] for r in cur.fetchall()}
-                want_types = ([] if "preliminary" in have else ["preliminary"]) + \
-                             ([] if "confirmed" in have or not in_confirmed_window else ["confirmed"])
-                if not want_types:
+                if RUN_MODE in have:
                     continue
                 pid = resolve_player(conn, "dailyfaceoff_goalies", gl["name"], gl["dfo_player_id"], team_code, "G",
                                      game_id, already_queued, queue_rows)
                 status = gl.get("strength")
                 print(f"  {team_code} ({game_id}): {gl['name']!r} [{status}] -> "
-                      f"{'matched ' + pid if pid else 'QUEUED for review'}, writing {want_types if pid else []}")
+                      f"{'matched ' + pid if pid else 'QUEUED for review'}, writing {RUN_MODE if pid else '(nothing)'}")
                 if pid:
                     now = datetime.now(timezone.utc)
-                    rows += [(game_id, team_code, pid, t, now, status) for t in want_types]
+                    rows.append((game_id, team_code, pid, RUN_MODE, now, status))
         time.sleep(REQUEST_DELAY_SECONDS)
     return rows
 
@@ -464,20 +471,17 @@ def write_snapshots(conn_factory, table, rows):
 
 
 def main():
-    today = date.today()
-    print(f"NHL lineup/goalie ingest -- DRY_RUN={DRY_RUN} -- today {today} -- lookahead {LOOKAHEAD_DAYS}d -- "
-          f"'confirmed' triggers at each game's start time")
+    today = et_today()
+    print(f"NHL lineup/goalie ingest -- DRY_RUN={DRY_RUN} -- RUN_MODE={RUN_MODE} -- today (ET) {today} -- "
+          f"lookahead {LOOKAHEAD_DAYS}d (preliminary only)")
     if not os.environ.get("PGHOST"):
         print("No PGHOST set -- nothing to do.")
         return
     conn = get_db_conn()
     try:
-        dates = [today + timedelta(days=i) for i in range(LOOKAHEAD_DAYS + 1)]
-        start_times = fetch_start_times(dates)
-        print(f"Start times resolved for {len(start_times)} game(s) across {dates[0]}..{dates[-1]}")
         queue_rows = []
-        lineup_rows = lineup_snapshot_pass(conn, today, start_times, queue_rows)
-        goalie_rows = goalie_snapshot_pass(conn, today, start_times, queue_rows)
+        lineup_rows = lineup_snapshot_pass(conn, today, queue_rows)
+        goalie_rows = goalie_snapshot_pass(conn, today, queue_rows)
     finally:
         conn.close()
     write_snapshots(get_db_conn, "lineup_snapshots", lineup_rows)

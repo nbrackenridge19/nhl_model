@@ -109,6 +109,13 @@ SEASON ROLLOVER CHANGES (2026-27) — see chat for the reasoning behind each
    new games never reached the bet/result views). The v2/v4 experiment chain
    is refreshed only when REFRESH_EXPERIMENTAL=true. Each view is refreshed
    and committed on its own.
+10. After a game is ingested, its 'confirmed' lineup_snapshots row is
+    overwritten with the actual skaters from the box score -- see
+    overwrite_confirmed_snapshots(). The starting goalie for SvPctR
+    (compute_team_game_stats_row) is read from goalie_snapshots' 'confirmed'
+    row (the nightly DailyFaceoff capture) instead of being guessed from the
+    box score -- see confirmed_starting_goalie(). Neither goalie_snapshots
+    row is ever touched by this script.
 
 SAFETY
 ------
@@ -883,19 +890,41 @@ def report_review(conn_factory, review_rows, game_dates):
 
 # --------------------------- confirmed-snapshot overwrite ---------------------------
 
+def confirmed_starting_goalie(conn, game_id, team_code):
+    """The starting goalie for this team-game, per goalie_snapshots' 'confirmed' row -- the nightly
+    DailyFaceoff capture (nhl_lineup_goalie_ingest.py, RUN_MODE=confirmed), taken once every game of the
+    night has started. This is the ONLY source used for "who started" -- never a box score. Nick: a box
+    score cannot reliably tell you who started (a pulled starter can end up with less ice time than his
+    reliever), and Hockey-Reference's listing order is not a safe substitute either. Returns None if the
+    nightly capture missed this game (caller must handle that -- see compute_team_game_stats_row, which
+    already skips SvPctR cleanly when starting_goalie_id is None)."""
+    with conn.cursor() as cur:
+        cur.execute("select player_id from goalie_snapshots where game_id = %s and team_code = %s "
+                    "and snapshot_type = 'confirmed'", (game_id, team_code))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
 def overwrite_confirmed_snapshots(conn_factory, confirmed_lineup_info):
-    """Replaces the 'confirmed' lineup_snapshots/goalie_snapshots rows for each played team-game with the
-    ACTUAL roster from this game's box score -- the post-game result is definitive, so it overwrites
-    whatever DailyFaceoff's own 'confirmed' capture (nhl_lineup_goalie_ingest.py) projected: players who
-    were projected but did not dress are removed, and anyone who played but wasn't projected (a call-up,
-    a last-second swap) is added. 'preliminary' rows are never touched. See nhl_lineup_goalie_ingest.py's
-    docstring for the full reasoning (Nick's instruction: a 'confirmed' snapshot must still be correctable
-    once we know who actually played)."""
+    """Replaces the 'confirmed' lineup_snapshots rows (skaters only -- see NOTE) for each played team-game
+    with the ACTUAL skaters from this game's box score -- the post-game result is definitive, so it
+    overwrites whatever DailyFaceoff's own 'confirmed' capture (nhl_lineup_goalie_ingest.py) projected:
+    players who were projected but did not dress are removed, and anyone who played but wasn't projected
+    (a call-up, a last-second swap) is added. 'preliminary' rows are never touched. See
+    nhl_lineup_goalie_ingest.py's docstring for the full reasoning (Nick's instruction: a 'confirmed'
+    snapshot must still be correctable once we know who actually played).
+
+    NOTE, goalies: goalie_snapshots is NOT touched here, deliberately. Which goalie "started" is not
+    reliably derivable from a box score -- a starter who gets pulled can end up with less TOI than the
+    reliever who finishes the game, and Hockey-Reference's listing order is not a safe proxy either.
+    goalie_snapshots' 'confirmed' row is left exactly as the nightly DailyFaceoff capture wrote it, and
+    that row (not anything from the box score) is what feeds the SvPctR feature -- see
+    confirmed_starting_goalie() and compute_team_game_stats_row()."""
     if not confirmed_lineup_info:
         return
     if DRY_RUN:
-        print(f"[dry-run] would overwrite 'confirmed' lineup/goalie snapshots for {len(confirmed_lineup_info)} team-game(s) "
-              "with the actual roster")
+        print(f"[dry-run] would overwrite 'confirmed' lineup_snapshots for {len(confirmed_lineup_info)} team-game(s) "
+              "with the actual skaters (goalie_snapshots is left as DailyFaceoff projected it)")
         return
     conn = conn_factory()
     try:
@@ -910,16 +939,9 @@ def overwrite_confirmed_snapshots(conn_factory, confirmed_lineup_info):
                         cur, "insert into lineup_snapshots (game_id, team_code, player_id, snapshot_type, scraped_at) "
                             "values %s",
                         [(game_id, team_code, pid, "confirmed", now) for pid in info["skater_ids"]])
-                cur.execute("delete from goalie_snapshots where game_id = %s and team_code = %s "
-                            "and snapshot_type = 'confirmed'", (game_id, team_code))
-                if info["goalie_id"]:
-                    cur.execute(
-                        "insert into goalie_snapshots (game_id, team_code, player_id, snapshot_type, scraped_at, dfo_status) "
-                        "values (%s, %s, %s, 'confirmed', %s, %s)",
-                        (game_id, team_code, info["goalie_id"], now, "actual (post-game)"))
         conn.commit()
-        print(f"[live] overwrote 'confirmed' lineup/goalie snapshots for {len(confirmed_lineup_info)} team-game(s) "
-              "with the actual roster.")
+        print(f"[live] overwrote 'confirmed' lineup_snapshots for {len(confirmed_lineup_info)} team-game(s) "
+              "with the actual skaters.")
     finally:
         conn.close()
 
@@ -985,13 +1007,10 @@ def process_date(conn, d, season, prior_season):
         all_advanced += box["advanced"]
 
         for team_code, is_home in ((home_code, True), (away_code, False)):
-            starting_goalie = next(
-                (gl["player_id"] for gl in box["goalies"]
-                 if gl["team_code"] == team_code and gl.get("toi_seconds")
-                 and gl["toi_seconds"] == max(
-                     (gg["toi_seconds"] or 0) for gg in box["goalies"] if gg["team_code"] == team_code)),
-                None,
-            )
+            starting_goalie = confirmed_starting_goalie(conn, game_id, team_code)
+            if starting_goalie is None:
+                print(f"  WARNING {game_id} {team_code}: no goalie_snapshots 'confirmed' row -- SvPctR skipped for "
+                      "this team-game (the nightly DailyFaceoff capture must have missed this game)")
             team_total = box["team_totals"].get(team_code, {})
             all_team_stats.append(compute_team_game_stats_row(
                 conn, game_id, d, season, prior_season, team_code, is_home,
@@ -1007,7 +1026,10 @@ def process_date(conn, d, season, prior_season):
             confirmed_lineup_info.append({
                 "game_id": game_id, "team_code": team_code,
                 "skater_ids": [r["player_id"] for r in box["skaters"] if r["team_code"] == team_code],
-                "goalie_id": starting_goalie,
+                # No goalie_id here: which goalie is "the starter" is NOT reliably derivable from a box
+                # score total (a pulled goalie can easily have less TOI than the reliever who finished the
+                # game). goalie_snapshots' 'confirmed' row stays exactly what DailyFaceoff projected
+                # pre-game and is never corrected from the box score. See overwrite_confirmed_snapshots().
             })
         time.sleep(REQUEST_DELAY_SECONDS)
 
