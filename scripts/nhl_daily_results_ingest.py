@@ -672,6 +672,8 @@ MAIN_REFRESH_CHAIN = [
     "v_team_game_perspective", "v_team_trailing_perf", "v_lambda", "v_team_kf",
     "v_edge_threshold_by_season", "v_kelly_signal", "v_kelly_daily_return",
     "v_kelly_bank_theoretical", "v_kelly_bank_live",
+    "v_pregame_team_state",  # feeds nhl_pregame_signal.py's HomeAdjD/GDD/team_game_num; depends on
+                             # team_game_stats, which this run just updated, so it must be refreshed here too
 ]
 # v2/v4 model variants and the expected-goal-difference views they use. Not part
 # of the live betting chain; refreshed only when REFRESH_EXPERIMENTAL=true.
