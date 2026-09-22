@@ -122,7 +122,7 @@ SAFETY
 import os
 import re
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import requests
 import psycopg2
@@ -881,6 +881,49 @@ def report_review(conn_factory, review_rows, game_dates):
         conn.close()
 
 
+# --------------------------- confirmed-snapshot overwrite ---------------------------
+
+def overwrite_confirmed_snapshots(conn_factory, confirmed_lineup_info):
+    """Replaces the 'confirmed' lineup_snapshots/goalie_snapshots rows for each played team-game with the
+    ACTUAL roster from this game's box score -- the post-game result is definitive, so it overwrites
+    whatever DailyFaceoff's own 'confirmed' capture (nhl_lineup_goalie_ingest.py) projected: players who
+    were projected but did not dress are removed, and anyone who played but wasn't projected (a call-up,
+    a last-second swap) is added. 'preliminary' rows are never touched. See nhl_lineup_goalie_ingest.py's
+    docstring for the full reasoning (Nick's instruction: a 'confirmed' snapshot must still be correctable
+    once we know who actually played)."""
+    if not confirmed_lineup_info:
+        return
+    if DRY_RUN:
+        print(f"[dry-run] would overwrite 'confirmed' lineup/goalie snapshots for {len(confirmed_lineup_info)} team-game(s) "
+              "with the actual roster")
+        return
+    conn = conn_factory()
+    try:
+        now = datetime.now(timezone.utc)
+        with conn.cursor() as cur:
+            for info in confirmed_lineup_info:
+                game_id, team_code = info["game_id"], info["team_code"]
+                cur.execute("delete from lineup_snapshots where game_id = %s and team_code = %s "
+                            "and snapshot_type = 'confirmed'", (game_id, team_code))
+                if info["skater_ids"]:
+                    execute_values(
+                        cur, "insert into lineup_snapshots (game_id, team_code, player_id, snapshot_type, scraped_at) "
+                            "values %s",
+                        [(game_id, team_code, pid, "confirmed", now) for pid in info["skater_ids"]])
+                cur.execute("delete from goalie_snapshots where game_id = %s and team_code = %s "
+                            "and snapshot_type = 'confirmed'", (game_id, team_code))
+                if info["goalie_id"]:
+                    cur.execute(
+                        "insert into goalie_snapshots (game_id, team_code, player_id, snapshot_type, scraped_at, dfo_status) "
+                        "values (%s, %s, %s, 'confirmed', %s, %s)",
+                        (game_id, team_code, info["goalie_id"], now, "actual (post-game)"))
+        conn.commit()
+        print(f"[live] overwrote 'confirmed' lineup/goalie snapshots for {len(confirmed_lineup_info)} team-game(s) "
+              "with the actual roster.")
+    finally:
+        conn.close()
+
+
 # --------------------------- one date ---------------------------
 
 def process_date(conn, d, season, prior_season):
@@ -918,6 +961,8 @@ def process_date(conn, d, season, prior_season):
         return 0, failures
 
     all_skaters, all_goalies, all_advanced, all_games, all_team_stats, all_raw = [], [], [], [], [], []
+    confirmed_lineup_info = []  # [{'game_id','team_code','skater_ids','goalie_id'}] -- actual post-game roster,
+                                 # used to overwrite the 'confirmed' lineup/goalie snapshot with definitive truth
     for g in plan:
         home_code, away_code, game_id = g["home"], g["away"], g["game_id"]
         print(f"Scraping {away_code} @ {home_code} -> {game_id}")
@@ -959,6 +1004,11 @@ def process_date(conn, d, season, prior_season):
                 "pp_goals_raw": pp.get("pp_goals"), "pp_opp_raw": pp.get("pp_opp"),
                 "pk_ga_raw": pp.get("pk_goals_against"), "pk_opp_raw": pp.get("pk_opp"),
             })
+            confirmed_lineup_info.append({
+                "game_id": game_id, "team_code": team_code,
+                "skater_ids": [r["player_id"] for r in box["skaters"] if r["team_code"] == team_code],
+                "goalie_id": starting_goalie,
+            })
         time.sleep(REQUEST_DELAY_SECONDS)
 
     if not all_games:
@@ -987,6 +1037,8 @@ def process_date(conn, d, season, prior_season):
     upsert(get_db_conn, "player_advanced_game_appearances", all_advanced, ["game_id", "player_id"],
            ["game_id", "player_id", "team_code", "icf", "sat_for", "sat_against", "cf_pct",
             "crel_pct", "zone_start_off", "zone_start_def", "off_zone_start_pct", "hits", "blocks"])
+
+    overwrite_confirmed_snapshots(get_db_conn, confirmed_lineup_info)
 
     review = players_needing_review(conn, season, prior_season, all_skaters, all_goalies, set(new_players))
     report_review(get_db_conn, review, {g["game_id"]: g["date"] for g in all_games})
