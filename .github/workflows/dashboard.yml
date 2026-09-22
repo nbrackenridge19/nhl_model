@@ -1,0 +1,43 @@
+name: Generate dashboard
+
+# Runs on the same frequent schedule as the other scrapers -- cheap to run
+# (pure database reads), so no gameday pre-check needed. Only commits back
+# to the repo if the generated HTML actually changed, to avoid a flood of
+# empty commits when nothing's new.
+on:
+  schedule:
+    - cron: "*/10 11-21 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install psycopg2-binary
+
+      - name: Generate dashboard
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGPORT: ${{ secrets.PGPORT }}
+        run: python scripts/nhl_generate_dashboard.py
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html
+          git diff --staged --quiet || git commit -m "Update dashboard"
+          git push
