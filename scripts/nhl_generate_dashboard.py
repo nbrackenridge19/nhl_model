@@ -148,12 +148,14 @@ def get_all_seasons(conn):
 
 
 def get_season_wallet_returns(conn):
-    """Per-season wallet return: reset to that season's own season_config.starting_bankroll and compound
+    """Per-season wallet return %: reset to that season's own season_config.starting_bankroll and compound
     forward using ONLY that season's own v_kelly_daily_return rows (i.e. NOT the continuous cross-season
-    v_kelly_bank_theoretical series used elsewhere on this page). Verified against Nick's own reference
-    number: 1819 comes out to exactly $2,396.52 -- matching what he cited -- off a $5,000 starting
-    bankroll (season_config's actual configured value, not the $2,500 he mentioned; flagged in chat, not
-    silently changed to match)."""
+    v_kelly_bank_theoretical series used elsewhere on this page), expressed as a percentage of that
+    starting bankroll -- Nick: "$5000 bank, $2396 profit, that's a return of 47%", so wallet_return_pct =
+    wallet_return_dollar / starting_bankroll. The dollar figure itself was verified against Nick's own
+    reference number: 1819 comes out to exactly $2,396.52 -- matching what he cited -- off a $5,000
+    starting bankroll (season_config's actual configured value, not the $2,500 he mentioned once;
+    flagged in chat, not silently changed to match)."""
     with conn.cursor() as cur:
         cur.execute("""
             select sc.season, sc.starting_bankroll,
@@ -163,9 +165,13 @@ def get_season_wallet_returns(conn):
             group by sc.season, sc.starting_bankroll
         """)
         rows = cur.fetchall()
-    return {season: {"starting_bankroll": float(start), "ending_bank": float(end),
-                     "wallet_return": float(end) - float(start)}
-            for season, start, end in rows}
+    out = {}
+    for season, start, end in rows:
+        start, end = float(start), float(end)
+        wallet_return = end - start
+        out[season] = {"starting_bankroll": start, "ending_bank": end, "wallet_return": wallet_return,
+                       "wallet_return_pct": (wallet_return / start) if start else None}
+    return out
 
 
 def get_detail_season(conn):
@@ -368,7 +374,7 @@ def money(v):
     return f"{'+' if v >= 0 else '-'}${abs(v):,.2f}"
 
 
-def summary_row_html(label, s, wallet_return=None, bold=False):
+def summary_row_html(label, s, wallet_return_pct=None, bold=False):
     win_pct = f"{s['wins'] / s['bets_placed']:.0%}" if s["bets_placed"] else "-"
     profit_color = "#1a7f37" if s["profit"] >= 0 else "#c0392b"
     return_str = f"{s['return_pct']:+.1%}" if s["return_pct"] is not None else "-"
@@ -377,9 +383,9 @@ def summary_row_html(label, s, wallet_return=None, bold=False):
     delta = (s["model_logloss"] - s["market_logloss"]) if (
         s["model_logloss"] is not None and s["market_logloss"] is not None) else None
     delta_str = f"{delta:+.3f}" if delta is not None else "-"
-    if wallet_return is not None:
-        wr_color = "#1a7f37" if wallet_return >= 0 else "#c0392b"
-        wallet_cell = f"<td><span style=\"color:{wr_color}; font-weight:600;\">{money(wallet_return)}</span></td>"
+    if wallet_return_pct is not None:
+        wr_color = "#1a7f37" if wallet_return_pct >= 0 else "#c0392b"
+        wallet_cell = f"<td><span style=\"color:{wr_color}; font-weight:600;\">{wallet_return_pct:+.1%}</span></td>"
     else:
         wallet_cell = "<td>-</td>"
     style = "font-weight:700; border-top:2px solid #ccc;" if bold else ""
@@ -656,15 +662,18 @@ def render_html(model_version, bankroll, todays_rows, detail_season, week_groups
     totals = {"n_instances": 0, "bets_placed": 0, "wins": 0, "losses": 0, "wagered": 0.0, "profit": 0.0,
               "model_logloss": None, "market_logloss": None}
     ll_sum = ll_n = vll_sum = vll_n = 0
-    total_wallet_return = 0.0
+    total_wallet_return_dollar = 0.0
+    total_starting_bankroll = 0.0
     for season, s in season_summaries:
         disp = f"{season[:2]}-{season[2:]}"
-        wr = wallet_returns.get(season, {}).get("wallet_return")
-        season_rows_html += summary_row_html(disp, s, wallet_return=wr)
+        wr_pct = wallet_returns.get(season, {}).get("wallet_return_pct")
+        season_rows_html += summary_row_html(disp, s, wallet_return_pct=wr_pct)
         totals["bets_placed"] += s["bets_placed"]; totals["wins"] += s["wins"]; totals["losses"] += s["losses"]
         totals["wagered"] += s["wagered"]; totals["profit"] += s["profit"]
-        if wr is not None:
-            total_wallet_return += wr
+        season_wr = wallet_returns.get(season, {})
+        if season_wr.get("wallet_return") is not None:
+            total_wallet_return_dollar += season_wr["wallet_return"]
+            total_starting_bankroll += season_wr["starting_bankroll"]
         if s["model_logloss"] is not None:
             ll_sum += s["model_logloss"]; ll_n += 1
         if s["market_logloss"] is not None:
@@ -673,10 +682,14 @@ def render_html(model_version, bankroll, todays_rows, detail_season, week_groups
     totals["market_logloss"] = vll_sum / vll_n if vll_n else None
     totals["return_pct"] = (totals["profit"] / totals["wagered"]) if totals["wagered"] else None
     if season_summaries:
-        season_rows_html += summary_row_html("Total", totals, wallet_return=total_wallet_return, bold=True)
+        # Total wallet return %: total dollar wallet return across seasons / total starting bankroll
+        # across seasons -- a weighted average, same spirit as how the Return% total is total profit /
+        # total wagered rather than an unweighted average of each season's own %.
+        total_wr_pct = (total_wallet_return_dollar / total_starting_bankroll) if total_starting_bankroll else None
+        season_rows_html += summary_row_html("Total", totals, wallet_return_pct=total_wr_pct, bold=True)
 
-    detail_wr = wallet_returns.get(detail_season, {}).get("wallet_return")
-    detail_row_html = summary_row_html(season_disp, detail_season_summary, wallet_return=detail_wr)
+    detail_wr_pct = wallet_returns.get(detail_season, {}).get("wallet_return_pct")
+    detail_row_html = summary_row_html(season_disp, detail_season_summary, wallet_return_pct=detail_wr_pct)
 
     bankroll_str = f"${bankroll:,.2f}" if bankroll is not None else "-"
     html = (
