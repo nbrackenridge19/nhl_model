@@ -6,10 +6,16 @@ name: NHL T-5 Scheduler (sync Worker alarms)
 # Cheap (two small JSON fetches, no DB writes except reads) and idempotent -- calling it
 # again for a game just resets the alarm to whatever start time ESPN currently shows, so
 # running this often is fine and is how postponements/time changes get picked up.
+#
+# Triggered two ways: (1) the Cloudflare Worker's own cron trigger fires a "t5-schedule"
+# repository_dispatch every 30 minutes (the reliable path -- Cloudflare's scheduler, not GitHub's),
+# and (2) GitHub's own cron below, kept as a redundant backup. Running both is harmless.
 
 on:
+  repository_dispatch:
+    types: [t5-schedule]
   schedule:
-    - cron: '*/30 * * * *'  # every 30 minutes
+    - cron: '*/30 * * * *'  # backup only -- the Worker's cron trigger is the primary
   workflow_dispatch:
     inputs:
       dry_run:
@@ -21,9 +27,9 @@ on:
           - 'true'
           - 'false'
       lookahead_days:
-        description: 'Days ahead of today to schedule (scheduled cron runs always use 1)'
+        description: 'Days ahead of today to schedule (automatic runs always use 3)'
         required: true
-        default: '1'
+        default: '3'
         type: string
 
 jobs:
@@ -50,7 +56,7 @@ jobs:
           PGDATABASE: ${{ secrets.PGDATABASE }}
           PGPORT: ${{ secrets.PGPORT }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
-          LOOKAHEAD_DAYS: ${{ github.event.inputs.lookahead_days || '1' }}
+          LOOKAHEAD_DAYS: ${{ github.event.inputs.lookahead_days || '3' }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
           SCHEDULE_SECRET: ${{ secrets.SCHEDULE_SECRET }}
         run: python scripts/nhl_t5_scheduler.py

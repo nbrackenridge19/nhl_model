@@ -2,7 +2,7 @@ name: NHL Odds Ingest
 
 on:
   schedule:
-    - cron: '*/10 * * * *'  # every 10 minutes -- approximates a "T-5"/closing-line capture without a precise trigger
+    - cron: '*/10 * * * *'  # every 10 minutes -- FALLBACK ONLY: captures games already at/past puck drop that the T-5 path missed
   workflow_dispatch:
     inputs:
       dry_run:
@@ -38,4 +38,8 @@ jobs:
           PGDATABASE: ${{ secrets.PGDATABASE }}
           PGPORT: ${{ secrets.PGPORT }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          # 0 = only capture games that have already started. The T-5 path (t5-trigger.yml) owns the
+          # pre-game capture; with the old default of 60 this cron grabbed the line ~50-60 min before
+          # puck drop and the T-5 run then found "odds already captured".
+          CAPTURE_WINDOW_MINUTES_BEFORE: '0'
         run: python scripts/nhl_odds_ingest.py
