@@ -1,0 +1,50 @@
+name: NHL T-5 Scheduler (sync Worker alarms)
+
+# Keeps the Cloudflare Worker's per-game Durable Object alarms in sync with the real
+# NHL schedule -- looks up each upcoming game's actual puck-drop time on ESPN and POSTs
+# it to the Worker's /schedule endpoint, which sets that game's alarm for exactly T-5.
+# Cheap (two small JSON fetches, no DB writes except reads) and idempotent -- calling it
+# again for a game just resets the alarm to whatever start time ESPN currently shows, so
+# running this often is fine and is how postponements/time changes get picked up.
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # every 30 minutes
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (true = no POSTs to the Worker)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  schedule:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests psycopg2-binary
+
+      - name: Sync Worker alarms with the schedule
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGPORT: ${{ secrets.PGPORT }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          SCHEDULE_SECRET: ${{ secrets.SCHEDULE_SECRET }}
+        run: python scripts/nhl_t5_scheduler.py

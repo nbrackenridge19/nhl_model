@@ -1,0 +1,91 @@
+name: NHL T-5 Trigger (odds + confirmed lineup/goalie)
+
+# Fires when the Cloudflare Worker's per-game Durable Object alarm calls GitHub's
+# repository_dispatch API at exactly T-5 minutes before that game's puck drop.
+# Replaces t5-dispatch-test.yml, the throwaway proof step used to debug the Worker's
+# dispatch path -- this is the real production consumer of the t5-trigger event.
+#
+# Runs both time-sensitive T-5 captures for the one dispatched game_id:
+#   - nhl_odds_ingest.py (TARGET_GAME_ID set): captures the DraftKings closing line
+#     for just this game, skipping the window scan entirely.
+#   - nhl_lineup_goalie_ingest.py (RUN_MODE=confirmed, TARGET_GAME_ID set): captures
+#     DailyFaceoff's confirmed lineup/goalie for just this game, at its own puck drop
+#     instead of waiting for the once-nightly 11pm ET sweep.
+#
+# The existing fallback cron schedules (odds every 10 min, lineup preliminary every
+# 30 min, lineup confirmed nightly at 11pm ET) keep running unchanged as a safety net
+# in case the Worker misses a game (a missed schedule call, a Cloudflare outage, etc).
+# Both scripts' inserts are never-overwrite, so there's no double-write risk from
+# running both the T-5 path and the fallback crons for the same game.
+#
+# DRY_RUN defaults to false here (unlike the other workflows) because this only ever
+# fires from a real T-5 alarm for a real game -- there's no cron schedule to
+# accidentally trigger it early, and running dry by default would silently do nothing
+# on every real dispatch. Use workflow_dispatch with dry_run=true to test by hand.
+
+on:
+  repository_dispatch:
+    types: [t5-trigger]
+  workflow_dispatch:
+    inputs:
+      game_id:
+        description: 'game_id to test with (e.g. 2627_26271)'
+        required: true
+      dry_run:
+        description: 'Dry run (true = no DB writes)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  t5-capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests psycopg2-binary beautifulsoup4
+
+      - name: Resolve game_id and dry_run for this run
+        id: params
+        run: |
+          echo "game_id=${{ github.event.client_payload.game_id || github.event.inputs.game_id }}" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${{ github.event.inputs.dry_run || 'false' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Show what was dispatched
+        run: |
+          echo "game_id: ${{ steps.params.outputs.game_id }}"
+          echo "dry_run: ${{ steps.params.outputs.dry_run }}"
+
+      - name: Capture closing odds
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGPORT: ${{ secrets.PGPORT }}
+          DRY_RUN: ${{ steps.params.outputs.dry_run }}
+          TARGET_GAME_ID: ${{ steps.params.outputs.game_id }}
+        run: python scripts/nhl_odds_ingest.py
+
+      - name: Capture confirmed lineup/goalie
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGPORT: ${{ secrets.PGPORT }}
+          DRY_RUN: ${{ steps.params.outputs.dry_run }}
+          RUN_MODE: confirmed
+          TARGET_GAME_ID: ${{ steps.params.outputs.game_id }}
+        run: python scripts/nhl_lineup_goalie_ingest.py
