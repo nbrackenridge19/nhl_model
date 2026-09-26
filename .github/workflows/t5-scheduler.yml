@@ -20,6 +20,11 @@ on:
         options:
           - 'true'
           - 'false'
+      lookahead_days:
+        description: 'Days ahead of today to schedule (scheduled cron runs always use 1)'
+        required: true
+        default: '1'
+        type: string
 
 jobs:
   schedule:
@@ -45,6 +50,7 @@ jobs:
           PGDATABASE: ${{ secrets.PGDATABASE }}
           PGPORT: ${{ secrets.PGPORT }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          LOOKAHEAD_DAYS: ${{ github.event.inputs.lookahead_days || '1' }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
           SCHEDULE_SECRET: ${{ secrets.SCHEDULE_SECRET }}
         run: python scripts/nhl_t5_scheduler.py
