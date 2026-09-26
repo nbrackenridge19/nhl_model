@@ -18,20 +18,39 @@ away). This script:
   2. For each regular-season event with a real start time that hasn't
      happened yet, resolves our internal game_id via the same (date, home,
      away) lookup the other T-5 scripts use.
-  3. POSTs {game_id, start_time_iso} to the Worker's /schedule endpoint.
+  3. If ESPN shows a matchup on a date our `games` table doesn't have, that game was probably MOVED
+     (postponement / reschedule). The schedule row is re-dated to ESPN's date BEFORE puck drop (see
+     MOVED GAMES below), so the alarm, the odds capture and the lineup/goalie capture all find it.
+  4. POSTs {game_id, start_time_iso} to the Worker's /schedule endpoint.
      The Worker computes T-5 itself and (re)sets that game's Durable Object
      alarm -- calling this again for the same game just resets the alarm to
      whatever start time ESPN now shows, which is exactly what you want if
      a game gets pushed back or moved up.
 
-This is meant to run every 30-60 minutes via GitHub Actions
-(t5-scheduler.yml) as an ordinary safety-net cron -- it's cheap (no scraping,
-just two small JSON fetches) and idempotent, so running it often is fine.
+This runs every 30 minutes (t5-scheduler.yml, kicked by the Cloudflare Worker's cron trigger, with
+GitHub's own cron as a backup) -- it's cheap (no scraping, a few small JSON fetches) and idempotent,
+so running it often is fine.
+
+MOVED GAMES
+--------------------------------------------------------------------------
+nhl_daily_results_ingest.py already re-dates a moved game, but only AFTER it has been played. Until then
+`games` keeps the old date, so a moved game would get no alarm and the odds/lineup scripts (which look the
+game up by its stored date) could not find it. This script now fixes that up front:
+
+  - An ESPN regular-season event with no `games` row on its date triggers a search among this season's
+    UNPLAYED rows for the same (home, away) matchup. A row is the moved one ("orphan") if ESPN has no live
+    event for that matchup on the row's own date (no event, or one marked postponed/canceled).
+    Many matchups appear more than once in the 84-game schedule (352 of them, checked against the real
+    table), so this is what tells the moved row apart from the others.
+  - Exactly one orphan -> `update games set date = <ESPN date>` for that game_id (only while it is still
+    unplayed). Zero or several -> nothing is changed and the reason is printed, so it can be handled by hand.
+  - Events ESPN marks postponed/canceled are never scheduled.
 
 SAFETY
 ------
 - DRY_RUN defaults to true -- prints what it would POST instead of POSTing.
-- Never touches the database -- read-only against `games`.
+- The ONLY thing this script ever writes is `games.date` for a game it has confirmed was moved (see MOVED
+  GAMES), and only for a row that is still unplayed. DRY_RUN prints the change instead of making it.
 - Skips any event ESPN doesn't have a real start time for yet, and any
   event that already started (Worker alarms firing on already-passed times
   fire almost immediately, which is a harmless catch-up, but there is no
@@ -48,12 +67,15 @@ import psycopg2
 import requests
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
-LOOKAHEAD_DAYS = int(os.environ.get("LOOKAHEAD_DAYS", "1"))  # today + this many days ahead
+LOOKAHEAD_DAYS = int(os.environ.get("LOOKAHEAD_DAYS", "3"))  # today + this many days ahead
 REQUEST_DELAY_SECONDS = 0.3
 REQUEST_TIMEOUT = 20
 
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 SCOREBOARD_URL = "https://site.web.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard"
+
+# ESPN event statuses meaning "this game is not happening on this date".
+DEAD_STATUSES = {"STATUS_POSTPONED", "STATUS_CANCELED", "STATUS_CANCELLED", "STATUS_RESCHEDULED"}
 
 WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
 SCHEDULE_SECRET = os.environ.get("SCHEDULE_SECRET", "")
@@ -97,6 +119,7 @@ def fetch_scoreboard(d):
         out.append({
             "start": start_dt,
             "started": bool(st.get("state") in ("in", "post")),
+            "status_name": st.get("name"),
             "home": normalize_team_code(str((home.get("team") or {}).get("abbreviation", "")).lower()),
             "away": normalize_team_code(str((away.get("team") or {}).get("abbreviation", "")).lower()),
             "season_type": (ev.get("season") or {}).get("type"),
@@ -110,6 +133,60 @@ def resolve_game_id(conn, d, home, away):
                     "and away_team = %s", (d, home, away))
         row = cur.fetchone()
         return row[0] if row else None
+
+
+_scoreboard_cache = {}
+
+
+def scoreboard_cached(d):
+    if d not in _scoreboard_cache:
+        _scoreboard_cache[d] = fetch_scoreboard(d)
+        time.sleep(REQUEST_DELAY_SECONDS)
+    return _scoreboard_cache[d]
+
+
+def latest_season(conn):
+    with conn.cursor() as cur:
+        cur.execute("select max(season) from games where playoff = false")
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def unplayed_rows_for_matchup(conn, season, home, away):
+    with conn.cursor() as cur:
+        cur.execute("select game_id, date from games where playoff = false and season = %s and home_team = %s "
+                    "and away_team = %s and home_goals is null order by date", (season, home, away))
+        return cur.fetchall()
+
+
+def find_moved_game(conn, season, home, away):
+    """-> (game_id, old_date, None) if exactly one unplayed row for this matchup has no live ESPN event on its
+    own date, else (None, None, reason)."""
+    rows = unplayed_rows_for_matchup(conn, season, home, away)
+    if not rows:
+        return None, None, "no unplayed row for this matchup in the schedule"
+    orphans = []
+    for gid, gdate in rows:
+        live = any(e["home"] == home and e["away"] == away and e["status_name"] not in DEAD_STATUSES
+                   for e in scoreboard_cached(gdate))
+        if not live:
+            orphans.append((gid, gdate))
+    if len(orphans) == 1:
+        return orphans[0][0], orphans[0][1], None
+    return None, None, (f"{len(orphans)} of {len(rows)} unplayed rows for this matchup have no live ESPN event on "
+                        f"their own date -- can't tell which one moved")
+
+
+def redate_game(conn, game_id, old_date, new_date):
+    if DRY_RUN:
+        print(f"  [dry-run] would re-date {game_id}: {old_date} -> {new_date}")
+        return True
+    with conn.cursor() as cur:
+        cur.execute("update games set date = %s where game_id = %s and playoff = false and home_goals is null "
+                    "and date = %s", (new_date, game_id, old_date))
+        n = cur.rowcount
+    conn.commit()
+    return n == 1
 
 
 def schedule_worker_alarm(game_id, start_time_iso):
@@ -156,18 +233,29 @@ def main():
             events += [(d, e) for e in fetch_scoreboard(d)]
             time.sleep(REQUEST_DELAY_SECONDS)
 
-        scheduled, skipped = 0, 0
+        season = latest_season(conn)
+        scheduled, skipped, redated = 0, 0, 0
         for d, e in events:
             if e["season_type"] != 2:
                 continue  # preseason/playoffs -- regular season only, matching the other T-5 scripts
-            if e["start"] is None or e["started"]:
+            if e["start"] is None or e["started"] or e["status_name"] in DEAD_STATUSES:
                 skipped += 1
                 continue
             game_id = resolve_game_id(conn, d, e["home"], e["away"])
             if game_id is None:
-                print(f"  {e['away']} @ {e['home']} on {d}: not found in games table -- skipping")
-                skipped += 1
-                continue
+                moved_id, old_date, reason = find_moved_game(conn, season, e["home"], e["away"])
+                if moved_id is None:
+                    print(f"  {e['away']} @ {e['home']} on {d}: not in games table and not a clear move ({reason}) "
+                          f"-- skipping, NEEDS MANUAL CHECK")
+                    skipped += 1
+                    continue
+                print(f"  MOVED: {e['away']} @ {e['home']} ({moved_id}) {old_date} -> {d}")
+                if not redate_game(conn, moved_id, old_date, d):
+                    print(f"  re-date of {moved_id} changed no row (already played or already moved?) -- skipping")
+                    skipped += 1
+                    continue
+                redated += 1
+                game_id = moved_id
             start_iso = e["start"].isoformat().replace("+00:00", "Z")
             ok, detail = schedule_worker_alarm(game_id, start_iso)
             status = "OK" if ok else "FAILED"
@@ -176,7 +264,7 @@ def main():
                 scheduled += 1
             time.sleep(REQUEST_DELAY_SECONDS)
 
-        print(f"Done. scheduled={scheduled} skipped={skipped}")
+        print(f"Done. scheduled={scheduled} skipped={skipped} redated={redated}")
     finally:
         conn.close()
 
