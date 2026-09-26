@@ -470,6 +470,10 @@ def goalie_snapshot_pass(conn, today, queue_rows):
                     have = {r[0] for r in cur.fetchall()}
                 if RUN_MODE in have:
                     continue
+                if TARGET_GAME_ID and str(gl.get("strength") or "").strip().lower() != "confirmed":
+                    print(f"  {team_code} ({game_id}): {gl['name']!r} [{gl.get('strength')}] -- not confirmed at T-5, "
+                          f"skipping (nightly sweep will capture)")
+                    continue
                 pid = resolve_player(conn, "dailyfaceoff_goalies", gl["name"], gl["dfo_player_id"], team_code, "G",
                                      game_id, already_queued, queue_rows)
                 status = gl.get("strength")
