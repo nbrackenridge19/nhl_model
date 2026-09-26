@@ -40,6 +40,16 @@ American-odds implied probability: positive ml -> 100/(ml+100); negative ml
 -> -ml/(-ml+100). vig_pct = home_implied + away_implied - 1. Thresholds from
 the schema note in the project overview: <=5% ok, 5-6% prelim, >=6% invalid.
 
+TARGET_GAME_ID (T-5 dispatch path)
+--------------------------------------------------------------------------
+When the Cloudflare Worker fires a game's T-5 alarm, the dispatched GitHub
+Actions workflow sets TARGET_GAME_ID to that one game_id. In that mode this
+script skips the window scan and day_after_fallback entirely and captures
+just that one game directly -- it's already known to be exactly at T-5, so
+there's no reason to re-derive that from a time window. Still tagged
+captured_via='t5_scan' (it is one, just triggered precisely instead of by
+a cron sweep) and still goes through the same never-overwrite insert.
+
 SAFETY
 --------------------------------------------------------------------------
 - DRY_RUN defaults to true.
@@ -59,6 +69,7 @@ from psycopg2.extras import execute_values
 import requests
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
+TARGET_GAME_ID = os.environ.get("TARGET_GAME_ID", "").strip() or None
 CAPTURE_WINDOW_MINUTES_BEFORE = int(os.environ.get("CAPTURE_WINDOW_MINUTES_BEFORE", "60"))
 CAPTURE_WINDOW_MINUTES_AFTER = int(os.environ.get("CAPTURE_WINDOW_MINUTES_AFTER", "30"))
 DAY_AFTER_LOOKBACK_DAYS = int(os.environ.get("DAY_AFTER_LOOKBACK_DAYS", "3"))
@@ -167,6 +178,14 @@ def resolve_game_id(conn, d, home, away):
         return row[0] if row else None
 
 
+def game_by_id(conn, game_id):
+    """-> (date, home_team, away_team) or None. Used by the TARGET_GAME_ID fast path."""
+    with conn.cursor() as cur:
+        cur.execute("select date, home_team, away_team from games where game_id = %s and playoff = false",
+                     (game_id,))
+        return cur.fetchone()
+
+
 def capture_event(conn, game_id, home, away, event_id, comp_id, captured_via, rows):
     home_ml, away_ml = fetch_draftkings_moneylines(event_id, comp_id)
     if home_ml is None and away_ml is None:
@@ -214,6 +233,26 @@ def t5_scan(conn, now, rows):
             continue
         capture_event(conn, gid, e["home"], e["away"], e["event_id"], e["comp_id"], "t5_scan", rows)
         time.sleep(REQUEST_DELAY_SECONDS)
+
+
+def capture_single_game(conn, game_id, rows):
+    """T-5 dispatch fast path -- capture exactly one game, already known to be at T-5, skipping the
+    window scan entirely. See TARGET_GAME_ID in the module docstring."""
+    print(f"== single-game capture (TARGET_GAME_ID={game_id}) ==")
+    info = game_by_id(conn, game_id)
+    if info is None:
+        print(f"  {game_id}: not found in games table (or is a playoff game) -- nothing to do")
+        return
+    d, home, away = info
+    if game_ids_with_odds(conn, [game_id]):
+        print(f"  {game_id}: odds already captured -- nothing to do")
+        return
+    events = {(e["home"], e["away"]): e for e in fetch_scoreboard(d)}
+    e = events.get((home, away))
+    if e is None:
+        print(f"  {away} @ {home} ({game_id}, {d}): not found on ESPN's scoreboard for that date")
+        return
+    capture_event(conn, game_id, home, away, e["event_id"], e["comp_id"], "t5_scan", rows)
 
 
 def day_after_fallback(conn, today, rows):
@@ -269,7 +308,8 @@ def write_rows(conn_factory, rows):
 
 def main():
     now = datetime.now(timezone.utc)
-    print(f"NHL odds ingest -- DRY_RUN={DRY_RUN} -- now (UTC) {now.isoformat(timespec='seconds')} -- "
+    print(f"NHL odds ingest -- DRY_RUN={DRY_RUN} -- TARGET_GAME_ID={TARGET_GAME_ID} -- "
+          f"now (UTC) {now.isoformat(timespec='seconds')} -- "
           f"window -{CAPTURE_WINDOW_MINUTES_AFTER}min/+{CAPTURE_WINDOW_MINUTES_BEFORE}min")
     if not os.environ.get("PGHOST"):
         print("No PGHOST set -- nothing to do.")
@@ -277,8 +317,11 @@ def main():
     conn = get_db_conn()
     rows = []
     try:
-        t5_scan(conn, now, rows)
-        day_after_fallback(conn, now.date(), rows)
+        if TARGET_GAME_ID:
+            capture_single_game(conn, TARGET_GAME_ID, rows)
+        else:
+            t5_scan(conn, now, rows)
+            day_after_fallback(conn, now.date(), rows)
     finally:
         conn.close()
     write_rows(get_db_conn, rows)

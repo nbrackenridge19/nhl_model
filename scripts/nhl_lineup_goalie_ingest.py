@@ -88,6 +88,20 @@ SAFETY
 - Preliminary looks at games within LOOKAHEAD_DAYS (default 2) and
   regular-season games only (DailyFaceoff doesn't cover preseason --
   confirmed 2026-09-19/20). Confirmed looks only at "today" (US/Eastern).
+
+TARGET_GAME_ID (T-5 dispatch path, RUN_MODE=confirmed only)
+--------------------------------------------------------------------------
+When the Cloudflare Worker fires a game's T-5 alarm, the dispatched
+workflow runs this script with RUN_MODE=confirmed and TARGET_GAME_ID set to
+that one game_id -- capturing DailyFaceoff's confirmed lineup/goalie for
+just that game, right at its own puck drop, instead of waiting for the
+once-nightly 11pm ET sweep. Both passes then restrict themselves to that
+one game's two teams rather than looping every team/date. The nightly
+unscoped confirmed run (lineup-goalie-confirmed.yml) keeps running
+unchanged as a safety net -- since neither pass overwrites an existing
+'confirmed' row, a T-5 capture that already ran for a game just means the
+11pm sweep finds nothing left to do for it. Ignored (has no effect) when
+RUN_MODE=preliminary.
 """
 
 import os
@@ -106,6 +120,9 @@ REQUEST_DELAY_SECONDS = 1.0
 RUN_MODE = os.environ.get("RUN_MODE", "").strip().lower()
 if RUN_MODE not in ("preliminary", "confirmed"):
     raise SystemExit(f"RUN_MODE must be 'preliminary' or 'confirmed', got {RUN_MODE!r}.")
+TARGET_GAME_ID = os.environ.get("TARGET_GAME_ID", "").strip() or None
+if TARGET_GAME_ID and RUN_MODE != "confirmed":
+    TARGET_GAME_ID = None  # only meaningful for the T-5 confirmed-mode dispatch path -- see module docstring
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -268,6 +285,14 @@ def resolve_game_id(conn, d, home, away):
     return row[0] if row else None
 
 
+def game_by_id(conn, game_id):
+    """-> (date, home_team, away_team) or None. Used by the TARGET_GAME_ID fast path."""
+    with conn.cursor() as cur:
+        cur.execute("select date, home_team, away_team from games where game_id = %s and playoff = false",
+                     (game_id,))
+        return cur.fetchone()
+
+
 # --------------------------- player matching + review queue ---------------------------
 
 def match_player(conn, name, expected_pos_group=None):
@@ -349,7 +374,18 @@ def lineup_snapshot_pass(conn, today, queue_rows):
     print(f"== lineup snapshots ({RUN_MODE}) ==")
     already_queued = open_review_dfo_ids(conn, "dailyfaceoff_lines")
     rows = []
-    for slug, expected_code in TEAM_SLUGS.items():
+
+    team_slugs = TEAM_SLUGS
+    if TARGET_GAME_ID:
+        info = game_by_id(conn, TARGET_GAME_ID)
+        if info is None:
+            print(f"  TARGET_GAME_ID={TARGET_GAME_ID}: not found in games table -- nothing to do")
+            return rows
+        _, home, away = info
+        slug_by_code = {v: k for k, v in TEAM_SLUGS.items()}
+        team_slugs = {slug_by_code[c]: c for c in (home, away) if c in slug_by_code}
+
+    for slug, expected_code in team_slugs.items():
         if RUN_MODE == "preliminary":
             game = upcoming_games_for_team(conn, expected_code, today, LOOKAHEAD_DAYS)
         else:
@@ -357,6 +393,8 @@ def lineup_snapshot_pass(conn, today, queue_rows):
         if game is None:
             continue
         game_id, gdate, home, away = game
+        if TARGET_GAME_ID and game_id != TARGET_GAME_ID:
+            continue  # defensive -- shouldn't happen given the team_slugs restriction above
         with conn.cursor() as cur:
             cur.execute("select distinct snapshot_type from lineup_snapshots where game_id = %s and team_code = %s",
                         (game_id, expected_code))
@@ -389,7 +427,19 @@ def goalie_snapshot_pass(conn, today, queue_rows):
     print(f"== goalie snapshots ({RUN_MODE}) ==")
     already_queued = open_review_dfo_ids(conn, "dailyfaceoff_goalies")
     rows = []
-    dates = [today + timedelta(days=i) for i in range(LOOKAHEAD_DAYS + 1)] if RUN_MODE == "preliminary" else [today]
+
+    target_home_away = None
+    if TARGET_GAME_ID:
+        info = game_by_id(conn, TARGET_GAME_ID)
+        if info is None:
+            print(f"  TARGET_GAME_ID={TARGET_GAME_ID}: not found in games table -- nothing to do")
+            return rows
+        gdate, home, away = info
+        dates = [gdate]
+        target_home_away = (home, away)
+    else:
+        dates = [today + timedelta(days=i) for i in range(LOOKAHEAD_DAYS + 1)] if RUN_MODE == "preliminary" else [today]
+
     for d in dates:
         games, err = fetch_goalies_for_date(d)
         if err:
@@ -403,6 +453,8 @@ def goalie_snapshot_pass(conn, today, queue_rows):
         for g in games:
             if g.get("home") is None:
                 print(f"  {d}: {g.get('note')}")
+                continue
+            if target_home_away and (g["home"], g["away"]) != target_home_away:
                 continue
             game_id = resolve_game_id(conn, d, g["home"], g["away"])
             if game_id is None:
@@ -472,8 +524,8 @@ def write_snapshots(conn_factory, table, rows):
 
 def main():
     today = et_today()
-    print(f"NHL lineup/goalie ingest -- DRY_RUN={DRY_RUN} -- RUN_MODE={RUN_MODE} -- today (ET) {today} -- "
-          f"lookahead {LOOKAHEAD_DAYS}d (preliminary only)")
+    print(f"NHL lineup/goalie ingest -- DRY_RUN={DRY_RUN} -- RUN_MODE={RUN_MODE} -- TARGET_GAME_ID={TARGET_GAME_ID} -- "
+          f"today (ET) {today} -- lookahead {LOOKAHEAD_DAYS}d (preliminary only)")
     if not os.environ.get("PGHOST"):
         print("No PGHOST set -- nothing to do.")
         return
