@@ -317,12 +317,19 @@ def match_player(conn, name, expected_pos_group=None):
     return None, f"ambiguous: {len(rows)} players share this normalized name"
 
 
-def most_recent_2526_team(conn, player_id):
+def most_recent_team(conn, player_id, game_id):
+    """Team of the player's most recent regular-season appearance, looking only at the season of the game
+    being processed and the season before it (so nothing is hard-coded to one year). A player with no
+    appearances in that window returns None and isn't team-checked. In season this means a mid-year trade is
+    flagged once, and stops being flagged after his first game for the new team."""
     with conn.cursor() as cur:
         cur.execute(
-            "select a.team_code from player_game_appearances a join games g using(game_id) "
-            "where a.player_id = %s and g.season = '2526' and g.playoff = false "
-            "order by g.date desc limit 1", (player_id,))
+            "select a.team_code from player_game_appearances a "
+            "join games g using(game_id) "
+            "join games cur_g on cur_g.game_id = %s "
+            "where a.player_id = %s and g.playoff = false "
+            "and g.season in (cur_g.season, ((cur_g.season::int - 101)::text)) "
+            "order by g.date desc limit 1", (game_id, player_id))
         row = cur.fetchone()
     return row[0] if row else None
 
@@ -363,7 +370,7 @@ def resolve_player(conn, source, name, dfo_player_id, team_code, expected_pos_gr
     if player_id is None:
         queue_rows.append((source, dfo_player_id, name, expected_pos_group, team_code, err, game_id))
         return None
-    seen_team = most_recent_2526_team(conn, player_id)
+    seen_team = most_recent_team(conn, player_id, game_id)
     if seen_team and seen_team != team_code:
         queue_rows.append((source, dfo_player_id, name, expected_pos_group, team_code,
                            f"team mismatch: last seen on {seen_team}, DailyFaceoff shows {team_code}", game_id))
