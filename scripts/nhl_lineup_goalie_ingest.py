@@ -299,8 +299,10 @@ def match_player(conn, name, expected_pos_group=None):
     """-> (player_id, None) | (None, 'no match') | (None, 'ambiguous: n candidates')."""
     nm = normalize_name(name)
     with conn.cursor() as cur:
+        # Provisional rows created by nhl_add_player.py ('dfo_<id>') are excluded: they exist only so a brand-new
+        # player can be in snapshots before his real Hockey-Reference id appears. Once the real row exists it wins.
         cur.execute(
-            "select player_id, position from players where "
+            "select player_id, position from players where player_id not like 'dfo\\_%%' and "
             "trim(regexp_replace(replace(regexp_replace(lower(unaccent(player_name_display)), '[.''\u2019]', '', 'g'), '-', ' '), '\\s+', ' ', 'g')) = %s",
             (nm,))
         rows = cur.fetchall()
@@ -331,10 +333,32 @@ def open_review_dfo_ids(conn, source):
         return {r[0] for r in cur.fetchall()}
 
 
+_RESOLVED_CACHE = {}
+
+
+def resolved_map(conn, source):
+    """dfo_player_id -> player_id for queue rows Nick already resolved with nhl_add_player.py."""
+    if source not in _RESOLVED_CACHE:
+        with conn.cursor() as cur:
+            cur.execute("select dfo_player_id, resolved_player_id from player_id_review_queue "
+                        "where source = %s and status = 'resolved' and dfo_player_id is not null "
+                        "and resolved_player_id is not null", (source,))
+            _RESOLVED_CACHE[source] = {r[0]: r[1] for r in cur.fetchall()}
+    return _RESOLVED_CACHE[source]
+
+
 def resolve_player(conn, source, name, dfo_player_id, team_code, expected_pos_group, game_id, already_queued, queue_rows):
     """-> internal player_id, or None if the player was queued for review instead."""
     if dfo_player_id in already_queued:
         return None  # already flagged from an earlier page/run this session; don't write it and don't re-flag
+    # A player Nick already resolved never comes back for review (new player, trade, name collision alike).
+    prior = resolved_map(conn, source).get(dfo_player_id)
+    if prior:
+        if prior.startswith("dfo_"):
+            # Provisional id: switch to the real Hockey-Reference row as soon as one matches by name.
+            real_id, _ = match_player(conn, name, expected_pos_group)
+            return real_id or prior
+        return prior
     player_id, err = match_player(conn, name, expected_pos_group)
     if player_id is None:
         queue_rows.append((source, dfo_player_id, name, expected_pos_group, team_code, err, game_id))
