@@ -44,6 +44,10 @@ on:
           - 'true'
           - 'false'
 
+permissions:
+  contents: read
+  actions: write   # lets the last step start the dashboard workflow
+
 jobs:
   t5-capture:
     runs-on: ubuntu-latest
@@ -103,3 +107,12 @@ jobs:
           PGPORT: ${{ secrets.PGPORT }}
           DRY_RUN: ${{ steps.params.outputs.dry_run }}
         run: python scripts/nhl_pregame_signal.py
+
+      # Refresh the dashboard right after the signal freezes so the bet + skater check are visible before puck
+      # drop. Best-effort: the dashboard's own 10-minute cron is the backup, so a failure here never fails the run.
+      - name: Refresh dashboard
+        if: steps.params.outputs.dry_run != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run dashboard.yml --repo "${{ github.repository }}"

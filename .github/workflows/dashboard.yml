@@ -6,7 +6,8 @@ name: Generate dashboard
 # empty commits when nothing's new.
 on:
   schedule:
-    - cron: "*/10 11-21 * * *"
+    # 11:00-04:59 UTC = 7am-12:59am ET, so evening T-5 signals and the skater check show up before puck drop.
+    - cron: "*/10 11-23,0-4 * * *"
   workflow_dispatch: {}
 
 permissions:
