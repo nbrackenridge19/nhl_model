@@ -169,35 +169,92 @@ def backfill_preliminary(cur, game_id, team, player_id):
         print("  bet signal may already be frozen too. It can't be redone for that game.")
 
 
+def search_last_name(conn, display):
+    """Broad find: any known player sharing this name's last word, accent/case-insensitive. Used for every
+    queued player, not just team-mismatch/ambiguous ones -- a spelling or accent difference (e.g. 'Alexander
+    Steeves' vs the model's 'Alex Steeves') produces the exact same 'no match in players' reason as a genuinely
+    new player, so 'no match' alone can't tell the two apart. Never matches a provisional (dfo_...) row."""
+    words = norm(display).split()
+    if not words:
+        return []
+    with conn.cursor() as cur:
+        cur.execute("select player_id, player_name_display, position from players where player_id not like 'dfo\\_%' "
+                    "and lower(unaccent(player_name_display)) like %s order by player_name_display",
+                    ('%' + words[-1],))
+        return cur.fetchall()
+
+
+def search_by_text(conn, term):
+    with conn.cursor() as cur:
+        cur.execute("select player_id, player_name_display, position from players where player_id not like 'dfo\\_%' "
+                    "and lower(player_name_display) like %s order by player_name_display", ('%' + term.lower() + '%',))
+        return cur.fetchall()
+
+
+def describe_candidate(conn, c):
+    """players.position is never populated (it's blank for every row in the table, not just these), so it's no
+    help telling two same-named players apart -- e.g. the two Sebastian Ahos, or the two Elias Petterssons.
+    What actually disambiguates them is which team and season they last played, so show that instead: it's
+    what tells you 'Carolina, still active this year' from 'Islanders, hasn't played since 2023-24'."""
+    pid, display, _pos = c
+    with conn.cursor() as cur:
+        cur.execute("select g.season, g.date, a.team_code from player_game_appearances a join games g using(game_id) "
+                    "where a.player_id = %s order by g.date desc limit 1", (pid,))
+        last = cur.fetchone()
+    if last:
+        season, gdate, team = last
+        return f"{pid}  {display}  (last: {team.upper()}, {season}, {gdate})"
+    return f"{pid}  {display}  (no appearances on record)"
+
+
+def find_existing_player(conn, name, qid, team, game_id):
+    """Offers every queued player (whatever the reason) a chance to be matched to a player already in the
+    model, before falling through to Rookie/Veteran/Skip. Returns True if resolved here (matched or skipped),
+    False if the caller should continue into the new-player flow."""
+    cur = conn.cursor()
+    cands = search_last_name(conn, name)
+    if cands:
+        for i, c in enumerate(cands, 1):
+            print(f"  {i}) {describe_candidate(conn, c)}")
+        pick = ask("  Existing player? (number, F = search a different name/spelling, N = new player, S = skip)",
+                   valid={str(i) for i in range(1, len(cands) + 1)} | {"F", "N", "S"})
+    else:
+        print("  no same-last-name matches in the model.")
+        pick = ask("  [F]ind by another name, [N]ew player, or [S]kip", valid={"F", "N", "S"})
+
+    while pick.upper() == "F":
+        term = ask("  Search text (any part of the name)")
+        cands = search_by_text(conn, term)
+        if not cands:
+            print("  no matches.")
+            pick = ask("  [F]ind again, [N]ew player, or [S]kip", valid={"F", "N", "S"})
+            continue
+        for i, c in enumerate(cands, 1):
+            print(f"  {i}) {describe_candidate(conn, c)}")
+        pick = ask("  Which one? (number, F = search again, N = new player, S = skip)",
+                   valid={str(i) for i in range(1, len(cands) + 1)} | {"F", "N", "S"})
+
+    if pick.upper() == "S":
+        return True
+    if pick.upper() == "N":
+        return False
+    pid = cands[int(pick) - 1][0]
+    if confirm(f"  Confirm {name} = {pid} for good?"):
+        cur.execute("update player_id_review_queue set status = 'resolved', resolved_player_id = %s, "
+                    "notes = 'confirmed via nhl_add_player' where id = %s", (pid, qid))
+        backfill_preliminary(cur, game_id, team, pid)
+        conn.commit()
+        print("  done.")
+    return True
+
+
 def handle_lineup_row(conn, row):
     qid, source, dfo_id, name, pos, team, reason, game_id = row
     print(f"\n[lineup] {name}  ({team}, {pos or '?'})  -- {reason}")
     cur = conn.cursor()
 
-    if not reason.startswith("no match"):
-        # Trade / name collision: the player exists, a human just has to confirm who he is.
-        from_nm = norm(name)
-        cur.execute("select player_id, player_name_display, position from players where player_id not like 'dfo\\_%%' "
-                    "and lower(trim(player_name_display)) = %s", (from_nm,))
-        cands = cur.fetchall()
-        if not cands:
-            print("  no existing player with that exact name; treating as a new player.")
-        else:
-            for i, c in enumerate(cands, 1):
-                print(f"  {i}) {c[0]}  {c[1]}  {c[2] or ''}")
-            pick = ask("  Which one is he? (number, N = new player, S = skip)",
-                       valid={str(i) for i in range(1, len(cands) + 1)} | {"N", "S"})
-            if pick.upper() == "S":
-                return
-            if pick.upper() != "N":
-                pid = cands[int(pick) - 1][0]
-                if confirm(f"  Confirm {name} = {pid} for good?"):
-                    cur.execute("update player_id_review_queue set status = 'resolved', resolved_player_id = %s, "
-                                "notes = 'confirmed via nhl_add_player' where id = %s", (pid, qid))
-                    backfill_preliminary(cur, game_id, team, pid)
-                    conn.commit()
-                    print("  done.")
-                return
+    if find_existing_player(conn, name, qid, team, game_id):
+        return
 
     grp = pos_group_default(pos)
     if grp == "G":
