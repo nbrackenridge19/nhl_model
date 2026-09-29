@@ -544,6 +544,13 @@ def league_avg_sv_pct_today(conn, season, before_date, prior_two_season_avg):
     this season's actual league SV% as league-wide games accumulate (N<=200
     -> pure prior; N>=25% of season's total non-playoff games -> pure
     current; linear in between)."""
+    # goalie_career_priors.league_avg_sv_pct is a Postgres `numeric` column,
+    # so psycopg2 hands this back as a Decimal. Cast once here so every
+    # branch below (including the blended one, which mixes it with a
+    # plain-float ratio) is pure float arithmetic. Same class of bug as the
+    # compute_team_game_stats_row fix above: this branch just hadn't fired
+    # yet because it only triggers once n > 200 league-wide games.
+    prior_two_season_avg = float(prior_two_season_avg)
     with conn.cursor() as cur:
         cur.execute(
             "select count(*) from games where season=%s and playoff=false and date < %s", (season, before_date))
@@ -577,12 +584,17 @@ def compute_team_game_stats_row(conn, game_id, game_date, season, prior_season, 
         back_to_back = cur.fetchone() is not None
 
     cf_td, ca_td = cumulative_cf_ca(conn, team_code, season, game_date)
-    prior_cf = prior_season_value(conn, team_code, prior_season, "corsi_for_pct") or 0.5
+    # prior_season_value() reads a Postgres `numeric` column, so psycopg2
+    # returns a Decimal when a prior-season row exists; the `or <float>`
+    # fallback only fires on a missing row, so without float() here this
+    # silently works in dry-run/backfill (no real prior-season row) but
+    # raises TypeError (Decimal * float) the first time it hits a real one.
+    prior_cf = float(prior_season_value(conn, team_code, prior_season, "corsi_for_pct") or 0.5)
     cf_pred = rc["cf_int"] + rc["cf_pycf"] * prior_cf
     corsi_for_pct = blended_rate(n, cf_pred, cf_td, cf_td + ca_td)
 
     pp_stats = pp_pk.get(team_code, {})
-    prior_pp = prior_season_value(conn, team_code, prior_season, "pp") or 0.2
+    prior_pp = float(prior_season_value(conn, team_code, prior_season, "pp") or 0.2)
     pp_pred = rc["pp_int"] + rc["pp_pypp"] * prior_pp
     with conn.cursor() as cur:
         cur.execute(
@@ -593,7 +605,7 @@ def compute_team_game_stats_row(conn, game_id, game_date, season, prior_season, 
         ppg_td, ppo_td = cur.fetchone()
     pp = blended_rate(n, pp_pred, ppg_td, ppo_td)
 
-    prior_pk = prior_season_value(conn, team_code, prior_season, "pk") or 0.8
+    prior_pk = float(prior_season_value(conn, team_code, prior_season, "pk") or 0.8)
     pk_pred = rc["pk_int"] + rc["pk_pypk"] * prior_pk
     with conn.cursor() as cur:
         cur.execute(
@@ -620,7 +632,13 @@ def compute_team_game_stats_row(conn, game_id, game_date, season, prior_season, 
                 lg_row = cur.fetchone()
                 prior_row = (0, 0.0, lg_row[0]) if lg_row else None
         if prior_row:
+            # career_sv_pct_above_expected / league_avg_sv_pct are `numeric`
+            # columns (career_shots is `integer`, already a safe int) — cast
+            # the Decimal ones to float here so they're safe to mix with the
+            # float() league_today below.
             career_shots, career_svae, league_avg = prior_row
+            career_svae = float(career_svae)
+            league_avg = float(league_avg)
             with conn.cursor() as cur:
                 cur.execute(
                     "select coalesce(sum(shots_against),0), coalesce(sum(saves),0) from goalie_game_appearances gga "
