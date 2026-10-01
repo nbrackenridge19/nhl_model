@@ -348,7 +348,6 @@ def scrape_game_box(game_id, game_date, home_team, away_team):
 
 def parse_skater_table(table, game_id, team_code):
     rows = []
-    total_goals = None
     for tr in table.find("tbody").find_all("tr"):
         cells = tr.find_all(["th", "td"])
         if not cells:
@@ -356,10 +355,19 @@ def parse_skater_table(table, game_id, team_code):
         row = {c.get("data-stat"): c.get_text(strip=True) for c in cells}
         player_cell = tr.find("td", {"data-stat": "player"})
         if player_cell is None:
-            # TOTAL row has no player link — this is where the team's final
-            # goal count for this table lives.
-            if row.get("goals"):
-                total_goals = parse_int(row.get("goals"))
+            # A team-total row, if one exists at all, is NOT inside <tbody> on
+            # Hockey-Reference -- confirmed live 2026-09-30: every game ingested
+            # that morning wrote NULL home_goals/away_goals into `games` because
+            # this exact lookup (TOTAL row inside tbody) never found anything,
+            # while every individual player row below parsed fine. This matches
+            # the same tbody/tfoot split already documented and handled for the
+            # 5v5 CF/CA table in parse_team_cf_ca_5v5 (team totals in <tfoot>,
+            # not <tbody>). Rather than relocate this lookup to tfoot and trade
+            # one fragile DOM assumption for another, team goals are now summed
+            # from the already-correctly-parsed player rows below instead (see
+            # total_goals after the loop) -- this can't drift if HR's footer
+            # markup changes again, since it doesn't depend on footer markup
+            # at all.
             continue
         player_id, player_name = extract_player_id(player_cell)
         if player_id is None:
@@ -378,6 +386,7 @@ def parse_skater_table(table, game_id, team_code):
             "shifts": parse_int(row.get("shifts")),
             "toi_seconds": parse_toi_seconds(row.get("time_on_ice")),
         })
+    total_goals = sum(r["goals"] for r in rows if r["goals"] is not None) if rows else None
     return rows, total_goals
 
 

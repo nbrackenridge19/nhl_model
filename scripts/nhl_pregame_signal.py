@@ -254,10 +254,23 @@ def team_features(conn, game_id, team_code, opp_code, is_home, season, prior_sea
 
     cap = homeadjd_input(conn, team_code, season)
     if is_home:
-        home_attendance = st["avg_home_attendance"] if st["home_game_count"] >= 3 else cap
-        homeadjd = float(home_attendance) if home_attendance else 0.0
+        # Matches v_team_game_features EXACTLY (verified against its live SQL, not inferred):
+        #   HomeAdjD = (1 + LEAST(ratio, 1.0)) / 2
+        #   ratio = 1.0 if home_game_count < 3, else avg_home_attendance / cap
+        # i.e. a normalized value in [0.5, 1.0]. The previous version of this function fed in raw
+        # attendance/capacity (~15,000-19,000) instead of this ratio -- with the model's homeadjd
+        # coefficient (~0.14, fit on the real ~0.5-1.0 scale), that overwhelmed the sigmoid and
+        # saturated home_win_prob to ~1.0000 for every home team in every game, not just early season
+        # (the bug persists past 3 home games too, since raw avg_home_attendance is still unnormalized).
+        if st["home_game_count"] < 3:
+            ratio = 1.0
+        elif cap and st["avg_home_attendance"] is not None:
+            ratio = float(st["avg_home_attendance"]) / float(cap)
+        else:
+            ratio = 0.0  # defensive only -- shouldn't occur with a complete arenas table
+        homeadjd = (1.0 + min(ratio, 1.0)) / 2.0
     else:
-        homeadjd = 0.0  # matches v_team_game_features: HomeAdjD is the home team's own average, 0 for the away row
+        homeadjd = 0.0  # matches v_team_game_features: HomeAdjD is the home team's own value, 0 for the away row
 
     preptd_team = preseason_points(conn, team_code, season)
     preptd_opp = preseason_points(conn, opp_code, season)
