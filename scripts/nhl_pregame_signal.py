@@ -136,11 +136,20 @@ def pvadjsum(conn, game_id, team_code, snapshot_type):
 
 
 def preseason_points(conn, team_code, season):
+    # vegas_point_total is a Postgres `numeric` column, so psycopg2 returns a
+    # Decimal here. Every other raw numeric feeding features_home/away is
+    # either already an int (safe) or already cast with float() at its call
+    # site (pvadj_sum, arena cap) -- this was the one missed. Left as
+    # Decimal, home_f["_preptd"] - away_f["_preptd"] (Decimal - Decimal)
+    # succeeds silently with no arithmetic error, so the bad value rides all
+    # the way into the `features` dict and only blows up later, when
+    # psycopg2 tries to JSON-serialize it for the bet_signals insert
+    # (TypeError: Object of type Decimal is not JSON serializable).
     with conn.cursor() as cur:
         cur.execute("select vegas_point_total from preseason_points where team_code=%s and season=%s",
                     (team_code, season))
         row = cur.fetchone()
-    return row[0] if row else None
+    return float(row[0]) if row and row[0] is not None else None
 
 
 def homeadjd_input(conn, team_code, season):
