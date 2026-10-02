@@ -422,7 +422,14 @@ def parse_advanced_table(table, game_id, team_code):
     for tr in table.find("tbody").find_all("tr"):
         cells = tr.find_all(["th", "td"])
         row = {c.get("data-stat"): c.get_text(strip=True) for c in cells}
-        player_cell = tr.find("td", {"data-stat": "player"})
+        # On this table (unlike the skater/goalie tables) Hockey-Reference puts
+        # the player identifier in a <th scope="row"> cell, not a <td> --
+        # confirmed live 2026-10-02: tr.find("td", ...) never matched, so every
+        # row on every game was silently skipped and player_advanced_game_
+        # appearances got zero rows both nights, even though the <a href> and
+        # data-append-csv player id were present the whole time, just under
+        # <th> instead of <td>.
+        player_cell = tr.find(["td", "th"], {"data-stat": "player"})
         if player_cell is None:
             continue
         player_id, _ = extract_player_id(player_cell)
