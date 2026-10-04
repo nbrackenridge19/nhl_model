@@ -142,6 +142,35 @@ def get_todays_games(conn):
 ADD_PLAYER_CMD = "python nhl_add_player.py"
 
 
+def get_goalie_data(conn, game_ids):
+    """Per (game, team): starting goalie name + DailyFaceoff's status label, for both snapshot_types if
+    present. Mirrors get_skater_check_data's shape so goalie_cell can pick a snapshot the same way
+    skater_check_cell does (prefer the signal's own snapshot_type, else confirmed, else preliminary)."""
+    goalies = {}
+    if not game_ids:
+        return goalies
+    with conn.cursor() as cur:
+        cur.execute("""
+            select gs.game_id, gs.team_code, gs.snapshot_type, p.player_name_display, gs.dfo_status
+            from goalie_snapshots gs
+            join players p on p.player_id = gs.player_id
+            where gs.game_id = any(%s)""", (list(game_ids),))
+        for gid, team, stype, name, status in cur.fetchall():
+            goalies.setdefault((gid, team), {})[stype] = {"name": name, "status": status}
+    return goalies
+
+
+def goalie_cell(game_id, team, signal_snap, goalie_data):
+    by_type = goalie_data.get((game_id, team), {})
+    snap = signal_snap if signal_snap in by_type else (
+        "confirmed" if "confirmed" in by_type else ("preliminary" if "preliminary" in by_type else None))
+    if snap is None:
+        return "<td class=\"tag\">no goalie yet</td>"
+    g = by_type[snap]
+    label = g["status"] or snap
+    return f"<td>{g['name']} <span class=\"tag\">({label})</span></td>"
+
+
 def get_skater_check_data(conn, game_ids):
     """Per (game, team, snapshot_type): skater count, how many have a NULL PVAdj (and who), plus the open
     unmatched-player queue by team. Unmatched players are dropped from snapshots, so a short lineup is a
@@ -570,10 +599,11 @@ def render_wallet_chart_svg(bank_series, ll_delta_series, width=760, height=320)
     return "".join(svg)
 
 
-def render_todays_games(rows, skater_data=None):
+def render_todays_games(rows, skater_data=None, goalie_data=None):
     if not rows:
         return "<p class=\"meta\">No games scheduled today.</p>"
     snaps, queue = skater_data if skater_data else ({}, {})
+    goalie_data = goalie_data or {}
     html = ""
     for (game_id, home, away, h_fire, h_stake, h_mpct, h_mlpct, h_snap,
          a_fire, a_stake, a_mpct, a_mlpct, a_snap) in rows:
@@ -582,12 +612,13 @@ def render_todays_games(rows, skater_data=None):
             (away, home, False, a_fire, a_stake, a_mpct, a_mlpct, a_snap),
         ):
             check_td = skater_check_cell(game_id, team, snap, snaps, queue)
+            goalie_td = goalie_cell(game_id, team, snap, goalie_data)
             if mpct is None:
                 html += (
                     "<tr><td>" + f"{away.upper()} @ {home.upper()}" + "</td>"
                     f"<td>{team.upper()} {'(H)' if is_home else '(A)'}</td>"
                     "<td colspan=\"5\" class=\"tag\">awaiting odds/lineup data -- no signal yet</td>"
-                    f"{check_td}</tr>"
+                    f"{goalie_td}{check_td}</tr>"
                 )
                 continue
             mpct, mlpct = float(mpct), float(mlpct)
@@ -606,12 +637,14 @@ def render_todays_games(rows, skater_data=None):
                 f"<td>{mpct:.1%}</td>"
                 f"<td>{mlpct:.1%}</td>"
                 f"<td style=\"color:{delta_color}; font-weight:600;\">{delta:+.1%}</td>"
+                f"{goalie_td}"
                 f"{check_td}"
                 "</tr>"
             )
     return (
         "<table><tr><th>Matchup</th><th>Team</th><th>Bet?</th><th>$ Amount</th>"
-        "<th>Model %</th><th>Market %</th><th>Delta</th><th>Skater check</th></tr>" + html + "</table>"
+        "<th>Model %</th><th>Market %</th><th>Delta</th><th>Goalie</th><th>Skater check</th></tr>"
+        + html + "</table>"
     )
 
 
@@ -745,7 +778,7 @@ def render_nested_drilldown(groups_sorted, label_fn, all_pairs_by_game_id):
 
 def render_html(model_version, bankroll, todays_rows, detail_season, week_groups, team_groups,
                 season_summaries, pairs_by_game_id, wallet_returns, detail_season_summary, chart_svg,
-                skater_data=None, callout_html=""):
+                skater_data=None, callout_html="", goalie_data=None):
     season_disp = f"{detail_season[:2]}-{detail_season[2:]}"
 
     week_html = render_nested_drilldown(week_groups, lambda k: f"Week {k}", pairs_by_game_id)
@@ -796,7 +829,7 @@ def render_html(model_version, bankroll, todays_rows, detail_season, week_groups
         f"Updated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</div>"
         f"{callout_html}"
         "<h2>Today's games</h2>"
-        f"{render_todays_games(todays_rows, skater_data)}"
+        f"{render_todays_games(todays_rows, skater_data, goalie_data)}"
         f"<h2>{season_disp} at a glance</h2>"
         f"{summary_table_html('Season', detail_row_html)}"
         f"<h2>{season_disp} &mdash; wallet &amp; LogLoss over time</h2>"
@@ -820,6 +853,7 @@ def main():
         todays_rows = get_todays_games(conn)
         print(f"Today's games: {len(todays_rows)}")
         skater_data = get_skater_check_data(conn, [r[0] for r in todays_rows])
+        goalie_data = get_goalie_data(conn, [r[0] for r in todays_rows])
         callout_html = render_attention_callout(*get_attention_callout(conn))
 
         detail_season = get_detail_season(conn)
@@ -854,7 +888,7 @@ def main():
         f.write(render_html(model_version, bankroll, todays_rows, detail_season,
                             week_groups, team_groups, season_summaries, pairs_by_game_id,
                             wallet_returns, detail_season_summary, chart_svg,
-                            skater_data, callout_html))
+                            skater_data, callout_html, goalie_data))
     print(f"Dashboard written to {OUTPUT_PATH}")
 
 
