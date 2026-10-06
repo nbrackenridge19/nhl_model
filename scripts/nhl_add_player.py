@@ -151,11 +151,25 @@ def open_lineup_rows(cur):
     return cur.fetchall()
 
 
-def backfill_preliminary(cur, game_id, team, player_id):
+def backfill_preliminary(cur, game_id, team, player_id, source=None):
     """The lineup ingest never overwrites a snapshot, so a player who was unmatched when the preliminary
     lineup was written is missing from it. Add him. The confirmed snapshot is written at T-5 from a fresh
-    scrape, so if it hasn't happened yet he'll be in it automatically."""
+    scrape, so if it hasn't happened yet he'll be in it automatically.
+
+    Goalies (queue source 'dailyfaceoff_goalies') are different: they live in goalie_snapshots, one row per
+    game/team/snapshot type, and must never be written into lineup_snapshots. For them this only reports
+    what is on file."""
     if not game_id or not team:
+        return
+    if source == "dailyfaceoff_goalies":
+        cur.execute("select snapshot_type, player_id from goalie_snapshots where game_id = %s and team_code = %s "
+                    "order by snapshot_type", (game_id, team))
+        on_file = cur.fetchall()
+        shown = ", ".join(f"{t}={p}" for t, p in on_file) or "nothing"
+        print(f"  goalie: not added to any lineup. goalie_snapshots for that game/team currently has: {shown}")
+        if not any(t == "confirmed" for t, _p in on_file):
+            print("  NOTE: there is no confirmed goalie row for that game/team. Future games pick him up")
+            print("  automatically, but if that game has already started the confirmed row has to be added by hand.")
         return
     cur.execute("select distinct snapshot_type from lineup_snapshots where game_id = %s and team_code = %s",
                 (game_id, team))
@@ -178,7 +192,8 @@ def search_last_name(conn, display):
     if not words:
         return []
     with conn.cursor() as cur:
-        cur.execute("select player_id, player_name_display, position from players where player_id not like 'dfo\\_%' "
+        # '%%' (not '%'): this query also takes parameters, so a literal percent sign must be doubled.
+        cur.execute("select player_id, player_name_display, position from players where player_id not like 'dfo\\_%%' "
                     "and lower(unaccent(player_name_display)) like %s order by player_name_display",
                     ('%' + words[-1],))
         return cur.fetchall()
@@ -186,7 +201,7 @@ def search_last_name(conn, display):
 
 def search_by_text(conn, term):
     with conn.cursor() as cur:
-        cur.execute("select player_id, player_name_display, position from players where player_id not like 'dfo\\_%' "
+        cur.execute("select player_id, player_name_display, position from players where player_id not like 'dfo\\_%%' "
                     "and lower(player_name_display) like %s order by player_name_display", ('%' + term.lower() + '%',))
         return cur.fetchall()
 
@@ -207,7 +222,7 @@ def describe_candidate(conn, c):
     return f"{pid}  {display}  (no appearances on record)"
 
 
-def find_existing_player(conn, name, qid, team, game_id):
+def find_existing_player(conn, name, qid, team, game_id, source=None):
     """Offers every queued player (whatever the reason) a chance to be matched to a player already in the
     model, before falling through to Rookie/Veteran/Skip. Returns True if resolved here (matched or skipped),
     False if the caller should continue into the new-player flow."""
@@ -242,7 +257,7 @@ def find_existing_player(conn, name, qid, team, game_id):
     if confirm(f"  Confirm {name} = {pid} for good?"):
         cur.execute("update player_id_review_queue set status = 'resolved', resolved_player_id = %s, "
                     "notes = 'confirmed via nhl_add_player' where id = %s", (pid, qid))
-        backfill_preliminary(cur, game_id, team, pid)
+        backfill_preliminary(cur, game_id, team, pid, source)
         conn.commit()
         print("  done.")
     return True
@@ -253,7 +268,7 @@ def handle_lineup_row(conn, row):
     print(f"\n[lineup] {name}  ({team}, {pos or '?'})  -- {reason}")
     cur = conn.cursor()
 
-    if find_existing_player(conn, name, qid, team, game_id):
+    if find_existing_player(conn, name, qid, team, game_id, source):
         return
 
     grp = pos_group_default(pos)
@@ -264,6 +279,7 @@ def handle_lineup_row(conn, row):
                         "on conflict (player_id) do nothing", (pid, name))
             cur.execute("update player_id_review_queue set status = 'resolved', resolved_player_id = %s, "
                         "notes = 'goalie added via nhl_add_player' where id = %s", (pid, qid))
+            backfill_preliminary(cur, game_id, team, pid, source)
             conn.commit()
             print("  done. The next goalie run will pick him up.")
         return
