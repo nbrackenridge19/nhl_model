@@ -1,107 +1,58 @@
 """
-nhl_lineup_goalie_ingest.py -- captures projected lineups and starting goalies
-from DailyFaceoff into lineup_snapshots / goalie_snapshots, and queues any
-player it can't confidently match into player_id_review_queue instead of
+nhl_lineup_goalie_ingest.py -- captures DailyFaceoff lineups and starting goalies into lineup_snapshots /
+goalie_snapshots, and queues any player it can't confidently match into player_id_review_queue instead of
 guessing.
 
-This script runs in one of two modes, set by the RUN_MODE env var, each on
-its own GitHub Actions schedule:
+SNAPSHOT LIFECYCLE (changed 2026-10-13)
+--------------------------------------------------------------------------
+A game's snapshot is a LIVE row until the T-5 freeze, then a final row:
 
   RUN_MODE=preliminary  (lineup-goalie-preliminary.yml, every 30 minutes)
-    The first time this script sees a (game_id, team_code) with no
-    'preliminary' row yet, it writes whatever DailyFaceoff shows, however
-    far out that is. Never overwritten by this script.
+    LIVE refresh. Every run re-reads DailyFaceoff and REPLACES the team-game's 'preliminary' rows (lineup and
+    goalie), stamping scraped_at with the time of this read. It keeps doing that until the game is frozen
+    ('confirmed' row exists) or puck drop has passed (games.start_time, filled in by nhl_t5_scheduler.py).
+    A failed fetch, an empty page, or a goalie DailyFaceoff hasn't listed never wipes an existing row.
 
-  RUN_MODE=confirmed  (lineup-goalie-confirmed.yml, once nightly)
-    A single end-of-night pass, scheduled for after every one of that day's
-    games has started (Nick: "we should be running one, end of night
-    dailyfaceoff check once all games have started ... that's the definitive
-    proof" -- by then DailyFaceoff's goalie/line pages reflect who is
-    actually playing, not a projection). Scheduled for 04:00 UTC, which is
-    11pm-12am ET depending on DST -- always at or after 11pm ET, which is
-    after every NHL game's start on a normal schedule (the latest starts,
-    West Coast games, go off around 10-10:30pm ET). For every game whose
-    date is "today" in US/Eastern (computed with zoneinfo, not the runner's
-    UTC clock) and has no 'confirmed' row yet, writes whatever DailyFaceoff
-    shows as 'confirmed' -- no per-game start-time check, since the whole
-    point of the nightly timing is that every game already qualifies.
+  RUN_MODE=confirmed + TARGET_GAME_ID  (t5-trigger.yml, fired by the Cloudflare Worker at T-5)
+    FINAL FREEZE for that one game. Reads DailyFaceoff right now and REPLACES the game's 'confirmed' rows with
+    whatever DailyFaceoff shows -- whatever its status (Confirmed / Likely / blank); the status is stored in
+    goalie_snapshots.dfo_status. Nothing before this moment freezes anything. Refuses to run without
+    TARGET_GAME_ID, and skips a game that started more than FREEZE_GRACE_MINUTES ago.
 
-CONFIRMED ROWS AND POST-GAME CORRECTION
+  RUN_MODE=freeze_missed  (lineup-goalie-confirmed.yml, once each morning)
+    Safety net for a game whose T-5 freeze never happened (Worker outage, etc.): for any game from the last
+    7 days (before today, ET) with live rows but no 'confirmed' rows, copies the latest live rows into
+    'confirmed' unchanged, keeping their original scraped_at. Runs before the daily results ingest.
+
+AFTER THE GAME (nhl_daily_results_ingest.py) -- the one definitive overwrite
 --------------------------------------------------------------------------
-- lineup_snapshots' 'confirmed' row IS later overwritten -- but only by
-  nhl_daily_results_ingest.py, once it knows who actually played (see that
-  script's overwrite_confirmed_snapshots()). That result is definitive, so it
-  replaces whatever DailyFaceoff projected: skaters DailyFaceoff listed who
-  did not actually dress are removed, and anyone who played but wasn't
-  projected (a call-up, a last-second swap) is added. This script itself
-  never touches an existing 'confirmed' row.
-- goalie_snapshots' 'confirmed' row is NEVER overwritten by the results
-  ingest. Nick: a box score cannot reliably tell you who started -- a
-  starter who gets pulled can end up with less ice time than the goalie who
-  relieves him, and Hockey-Reference's listing order is not a safe proxy
-  either. The nightly DailyFaceoff capture (this script, RUN_MODE=confirmed)
-  is goalie_snapshots' only and final word, and nhl_daily_results_ingest.py
-  reads it back (rather than deriving anything from the box score) for the
-  SvPctR feature's starting-goalie identity.
-  Side effect worth knowing: v_lineup_fallback_status's "used_fallback" flag
-  (no confirmed row before the game) stops being a reliable historical
-  record of pre-game LINEUP data quality once the post-game overwrite always
-  adds a confirmed row -- it will read false after the fact even for a game
-  whose real pre-game 'confirmed' capture failed. (v_goalie_fallback_status
-  is unaffected, since goalie_snapshots is never overwritten.) Flagging
-  this; not changing the view without a separate decision.
+  - Skaters: the 'confirmed' lineup is replaced by the skaters who actually played.
+  - Goalie: the frozen 'confirmed' goalie is kept unless he did not appear in the box score at all (or no
+    snapshot exists), in which case the goalie with the most ice time replaces him.
+  This script never touches a game after its freeze other than through freeze_missed.
 
 DFO_STATUS COLUMN (goalie_snapshots only)
 --------------------------------------------------------------------------
-DailyFaceoff's own confidence label (homeNewsStrengthName / away...) for the
-starting goalie -- e.g. 'Confirmed' -- is stored verbatim in the
-goalie_snapshots.dfo_status column. Informational only.
+DailyFaceoff's own published status for the goalie (homeNewsStrengthName / awayNewsStrengthName): 'Confirmed',
+'Likely', or blank when DailyFaceoff has not marked him. Stored verbatim; the dashboard shows exactly this
+(blank -> "Unconfirmed") and never substitutes our own snapshot type for it.
 
-PLAYER MATCHING (this is the "prompts him" workflow Nick asked for)
+PLAYER MATCHING (this is the "prompts him" workflow)
 --------------------------------------------------------------------------
-For every skater DailyFaceoff lists in a team's 12 forwards / 6 defensemen
-(the 'ev' category groups f1-f4, d1-d3) and every starting/likely goalie:
-  1. Normalize the name (unaccent, drop punctuation) and look it up against
-     `players`. Zero or more-than-one match (after trying to break ties by
-     position) means "not confidently identified."
-  2. If matched, compare DailyFaceoff's team to the player's own most recent
-     2025-26 game appearance. A mismatch (a trade DailyFaceoff knows about
-     that we don't, or a bad match) is NOT auto-corrected.
-  3. Anything from (1) or (2) is written to player_id_review_queue (skipped
-     for this snapshot, not guessed at) instead of lineup_snapshots /
-     goalie_snapshots. Everyone else on the same page still gets written
-     normally -- one flagged player doesn't block a team's snapshot.
-Players with 0 GP in 2025-26 who aren't in the DB at all will always queue
-here on first sighting, by design -- that is the point of the workflow.
-
-Injured/scratched players (DailyFaceoff's 'oi'/'ir' category) are excluded
-entirely, matching "roster boolean" = presence in the table.
+For every skater DailyFaceoff lists in a team's 12 forwards / 6 defensemen (the 'ev' category groups f1-f4,
+d1-d3) and every starting/likely goalie:
+  1. Normalize the name (unaccent, drop punctuation) and look it up against `players`. Zero or more-than-one
+     match (after trying to break ties by position) means "not confidently identified."
+  2. If matched, compare DailyFaceoff's team to the player's own most recent appearance. A mismatch (a trade
+     DailyFaceoff knows about that we don't, or a bad match) is NOT auto-corrected.
+  3. Anything from (1) or (2) is written to player_id_review_queue (skipped for this snapshot, not guessed
+     at). Everyone else on the same page is still written -- one flagged player doesn't block a team.
+Injured/scratched players ('oi'/'ir' categories) are excluded. DailyFaceoff doesn't cover preseason.
 
 SAFETY
 --------------------------------------------------------------------------
-- DRY_RUN defaults to true.
-- Never overwrites an existing snapshot row of either type (this script
-  never touches an existing 'preliminary' or 'confirmed' row -- only
-  nhl_daily_results_ingest.py's lineup overwrite does, and only for skaters).
-- RUN_MODE is required; the script exits with an error rather than guessing
-  which pass to run.
-- Preliminary looks at games within LOOKAHEAD_DAYS (default 2) and
-  regular-season games only (DailyFaceoff doesn't cover preseason --
-  confirmed 2026-09-19/20). Confirmed looks only at "today" (US/Eastern).
-
-TARGET_GAME_ID (T-5 dispatch path, RUN_MODE=confirmed only)
---------------------------------------------------------------------------
-When the Cloudflare Worker fires a game's T-5 alarm, the dispatched
-workflow runs this script with RUN_MODE=confirmed and TARGET_GAME_ID set to
-that one game_id -- capturing DailyFaceoff's confirmed lineup/goalie for
-just that game, right at its own puck drop, instead of waiting for the
-once-nightly 11pm ET sweep. Both passes then restrict themselves to that
-one game's two teams rather than looping every team/date. The nightly
-unscoped confirmed run (lineup-goalie-confirmed.yml) keeps running
-unchanged as a safety net -- since neither pass overwrites an existing
-'confirmed' row, a T-5 capture that already ran for a game just means the
-11pm sweep finds nothing left to do for it. Ignored (has no effect) when
-RUN_MODE=preliminary.
+DRY_RUN defaults to true. RUN_MODE is required. Preliminary looks at games within LOOKAHEAD_DAYS (default 2),
+regular season only.
 """
 
 import os
@@ -118,11 +69,15 @@ DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
 LOOKAHEAD_DAYS = int(os.environ.get("LOOKAHEAD_DAYS", "2"))
 REQUEST_DELAY_SECONDS = 1.0
 RUN_MODE = os.environ.get("RUN_MODE", "").strip().lower()
-if RUN_MODE not in ("preliminary", "confirmed"):
-    raise SystemExit(f"RUN_MODE must be 'preliminary' or 'confirmed', got {RUN_MODE!r}.")
+if RUN_MODE not in ("preliminary", "confirmed", "freeze_missed"):
+    raise SystemExit(f"RUN_MODE must be 'preliminary', 'confirmed' or 'freeze_missed', got {RUN_MODE!r}.")
 TARGET_GAME_ID = os.environ.get("TARGET_GAME_ID", "").strip() or None
-if TARGET_GAME_ID and RUN_MODE != "confirmed":
-    TARGET_GAME_ID = None  # only meaningful for the T-5 confirmed-mode dispatch path -- see module docstring
+if RUN_MODE == "confirmed" and not TARGET_GAME_ID:
+    raise SystemExit("RUN_MODE=confirmed is the T-5 final freeze and requires TARGET_GAME_ID "
+                     "(use RUN_MODE=freeze_missed for the morning safety net).")
+if RUN_MODE != "confirmed":
+    TARGET_GAME_ID = None
+FREEZE_GRACE_MINUTES = int(os.environ.get("FREEZE_GRACE_MINUTES", "15"))
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -399,39 +354,58 @@ def write_review_queue(conn_factory, rows):
         conn.close()
 
 
+# --------------------------- freshness guards ---------------------------
+
+def game_has_started(conn, game_id, grace_minutes=0):
+    """True once puck drop (+ grace) has passed. games.start_time is filled in by nhl_t5_scheduler.py; when it
+    isn't known yet this returns False and callers rely on their date filter."""
+    with conn.cursor() as cur:
+        cur.execute("select start_time from games where game_id = %s", (game_id,))
+        row = cur.fetchone()
+    if not row or row[0] is None:
+        return False
+    return datetime.now(timezone.utc) >= row[0] + timedelta(minutes=grace_minutes)
+
+
+def has_confirmed(conn, table, game_id, team_code):
+    with conn.cursor() as cur:
+        cur.execute(f"select 1 from {table} where game_id = %s and team_code = %s and snapshot_type = 'confirmed' limit 1",
+                    (game_id, team_code))
+        return cur.fetchone() is not None
+
+
 # --------------------------- lineups ---------------------------
 
 def lineup_snapshot_pass(conn, today, queue_rows):
+    """-> (rows, replace_keys). replace_keys = (game_id, team_code, snapshot_type) whose existing rows get replaced."""
     print(f"== lineup snapshots ({RUN_MODE}) ==")
     already_queued = open_review_dfo_ids(conn, "dailyfaceoff_lines")
-    rows = []
+    rows, replace_keys = [], []
+    snap_type = "confirmed" if RUN_MODE == "confirmed" else "preliminary"
+    slug_by_code = {v: k for k, v in TEAM_SLUGS.items()}
 
-    team_slugs = TEAM_SLUGS
-    if TARGET_GAME_ID:
+    targets = []  # (slug, team_code, game_id)
+    if RUN_MODE == "confirmed":
         info = game_by_id(conn, TARGET_GAME_ID)
         if info is None:
             print(f"  TARGET_GAME_ID={TARGET_GAME_ID}: not found in games table -- nothing to do")
-            return rows
+            return rows, replace_keys
         _, home, away = info
-        slug_by_code = {v: k for k, v in TEAM_SLUGS.items()}
-        team_slugs = {slug_by_code[c]: c for c in (home, away) if c in slug_by_code}
+        targets = [(slug_by_code[c], c, TARGET_GAME_ID) for c in (home, away) if c in slug_by_code]
+    else:
+        for slug, code in TEAM_SLUGS.items():
+            game = upcoming_games_for_team(conn, code, today, LOOKAHEAD_DAYS)
+            if game is not None:
+                targets.append((slug, code, game[0]))
 
-    for slug, expected_code in team_slugs.items():
-        if RUN_MODE == "preliminary":
-            game = upcoming_games_for_team(conn, expected_code, today, LOOKAHEAD_DAYS)
+    for slug, expected_code, game_id in targets:
+        if RUN_MODE == "confirmed":
+            if game_has_started(conn, game_id, FREEZE_GRACE_MINUTES):
+                print(f"  {expected_code} ({game_id}): started more than {FREEZE_GRACE_MINUTES} min ago -- not freezing")
+                continue
         else:
-            game = game_today_for_team(conn, expected_code, today)
-        if game is None:
-            continue
-        game_id, gdate, home, away = game
-        if TARGET_GAME_ID and game_id != TARGET_GAME_ID:
-            continue  # defensive -- shouldn't happen given the team_slugs restriction above
-        with conn.cursor() as cur:
-            cur.execute("select distinct snapshot_type from lineup_snapshots where game_id = %s and team_code = %s",
-                        (game_id, expected_code))
-            have = {r[0] for r in cur.fetchall()}
-        if RUN_MODE in have:  # this pass's type ('preliminary' or 'confirmed') already written
-            continue
+            if has_confirmed(conn, "lineup_snapshots", game_id, expected_code) or game_has_started(conn, game_id):
+                continue  # already frozen, or puck has dropped -- live refresh stops
         team_code, players, err = fetch_team_lines(slug)
         if err:
             print(f"  {expected_code} ({slug}): FAILED ({err})")
@@ -445,11 +419,16 @@ def lineup_snapshot_pass(conn, today, queue_rows):
                                  p["pos_group"], game_id, already_queued, queue_rows)
             if pid:
                 resolved.append(pid)
-        print(f"  {expected_code} -> {game_id}: {len(resolved)}/{len(players)} matched, writing {RUN_MODE}")
+        if not resolved:
+            print(f"  {expected_code} -> {game_id}: no players matched -- leaving existing {snap_type} snapshot untouched")
+            time.sleep(REQUEST_DELAY_SECONDS)
+            continue
+        print(f"  {expected_code} -> {game_id}: {len(resolved)}/{len(players)} matched, writing {snap_type}")
         now = datetime.now(timezone.utc)
-        rows += [(game_id, expected_code, pid, RUN_MODE, now) for pid in resolved]
+        rows += [(game_id, expected_code, pid, snap_type, now) for pid in resolved]
+        replace_keys.append((game_id, expected_code, snap_type))
         time.sleep(REQUEST_DELAY_SECONDS)
-    return rows
+    return rows, replace_keys
 
 
 # --------------------------- goalies ---------------------------
@@ -458,9 +437,10 @@ def goalie_snapshot_pass(conn, today, queue_rows):
     print(f"== goalie snapshots ({RUN_MODE}) ==")
     already_queued = open_review_dfo_ids(conn, "dailyfaceoff_goalies")
     rows = []
+    snap_type = "confirmed" if RUN_MODE == "confirmed" else "preliminary"
 
     target_home_away = None
-    if TARGET_GAME_ID:
+    if RUN_MODE == "confirmed":
         info = game_by_id(conn, TARGET_GAME_ID)
         if info is None:
             print(f"  TARGET_GAME_ID={TARGET_GAME_ID}: not found in games table -- nothing to do")
@@ -469,7 +449,7 @@ def goalie_snapshot_pass(conn, today, queue_rows):
         dates = [gdate]
         target_home_away = (home, away)
     else:
-        dates = [today + timedelta(days=i) for i in range(LOOKAHEAD_DAYS + 1)] if RUN_MODE == "preliminary" else [today]
+        dates = [today + timedelta(days=i) for i in range(LOOKAHEAD_DAYS + 1)]
 
     for d in dates:
         games, err = fetch_goalies_for_date(d)
@@ -491,49 +471,47 @@ def goalie_snapshot_pass(conn, today, queue_rows):
             if game_id is None:
                 print(f"  {g['away']} @ {g['home']} ({d}): not on the schedule")
                 continue
+            if RUN_MODE == "confirmed":
+                if game_has_started(conn, game_id, FREEZE_GRACE_MINUTES):
+                    print(f"  {game_id}: started more than {FREEZE_GRACE_MINUTES} min ago -- not freezing")
+                    continue
+            elif game_has_started(conn, game_id):
+                continue
             for team_code, gl in ((g["home"], g["home_goalie"]), (g["away"], g["away_goalie"])):
                 if gl is None:
-                    print(f"  {team_code} ({game_id}): no goalie listed yet")
+                    print(f"  {team_code} ({game_id}): no goalie listed yet -- existing snapshot untouched")
                     continue
-                with conn.cursor() as cur:
-                    cur.execute("select distinct snapshot_type from goalie_snapshots where game_id = %s and team_code = %s",
-                                (game_id, team_code))
-                    have = {r[0] for r in cur.fetchall()}
-                if RUN_MODE in have:
-                    continue
-                if TARGET_GAME_ID and str(gl.get("strength") or "").strip().lower() != "confirmed":
-                    print(f"  {team_code} ({game_id}): {gl['name']!r} [{gl.get('strength')}] -- not confirmed at T-5, "
-                          f"skipping (nightly sweep will capture)")
-                    continue
+                if RUN_MODE == "preliminary" and has_confirmed(conn, "goalie_snapshots", game_id, team_code):
+                    continue  # frozen
                 pid = resolve_player(conn, "dailyfaceoff_goalies", gl["name"], gl["dfo_player_id"], team_code, "G",
                                      game_id, already_queued, queue_rows)
                 status = gl.get("strength")
-                print(f"  {team_code} ({game_id}): {gl['name']!r} [{status}] -> "
-                      f"{'matched ' + pid if pid else 'QUEUED for review'}, writing {RUN_MODE if pid else '(nothing)'}")
+                print(f"  {team_code} ({game_id}): {gl['name']!r} [{status or 'unconfirmed'}] -> "
+                      f"{'matched ' + pid if pid else 'QUEUED for review'}, writing {snap_type if pid else '(nothing)'}")
                 if pid:
-                    now = datetime.now(timezone.utc)
-                    rows.append((game_id, team_code, pid, RUN_MODE, now, status))
+                    rows.append((game_id, team_code, pid, snap_type, datetime.now(timezone.utc), status))
         time.sleep(REQUEST_DELAY_SECONDS)
     return rows
 
 
 # --------------------------- write + main ---------------------------
 
-# Each table's insert columns (row tuples must be built in this order) and conflict target.
-# goalie_snapshots carries one extra column (dfo_status) that lineup_snapshots has no equivalent for.
+# goalie_snapshots carries one extra column (dfo_status). Both tables are REPLACED, not appended: lineups by
+# deleting the team-game's rows of that snapshot_type first, goalies by upserting on the conflict target.
 TABLE_SPEC = {
     "lineup_snapshots": {
         "columns": ["game_id", "team_code", "player_id", "snapshot_type", "scraped_at"],
-        "conflict": "(game_id, team_code, player_id, snapshot_type)",
+        "conflict": "(game_id, team_code, player_id, snapshot_type) do nothing",
     },
     "goalie_snapshots": {
         "columns": ["game_id", "team_code", "player_id", "snapshot_type", "scraped_at", "dfo_status"],
-        "conflict": "(game_id, team_code, snapshot_type)",
+        "conflict": "(game_id, team_code, snapshot_type) do update set player_id = excluded.player_id, "
+                    "scraped_at = excluded.scraped_at, dfo_status = excluded.dfo_status",
     },
 }
 
 
-def write_snapshots(conn_factory, table, rows):
+def write_snapshots(conn_factory, table, rows, replace_keys=None):
     if not rows:
         print(f"{table}: nothing to write.")
         return
@@ -546,13 +524,55 @@ def write_snapshots(conn_factory, table, rows):
     conn = conn_factory()
     try:
         with conn.cursor() as cur:
+            for gid, team, stype in (replace_keys or []):
+                cur.execute(f"delete from {table} where game_id = %s and team_code = %s and snapshot_type = %s",
+                            (gid, team, stype))
             execute_values(
                 cur,
-                f"insert into {table} ({', '.join(spec['columns'])}) values %s "
-                f"on conflict {spec['conflict']} do nothing",
+                f"insert into {table} ({', '.join(spec['columns'])}) values %s on conflict {spec['conflict']}",
                 rows)
         conn.commit()
         print(f"[live] wrote {len(rows)} row(s) to {table}.")
+    finally:
+        conn.close()
+
+
+def freeze_missed(conn_factory, today):
+    """Morning safety net: copy the latest live rows to 'confirmed' for recent finished games that never got a
+    T-5 freeze. Keeps the original scraped_at so the data's age stays honest."""
+    cutoff = today - timedelta(days=7)
+    lineup_sql = (
+        "insert into lineup_snapshots (game_id, team_code, player_id, snapshot_type, scraped_at) "
+        "select p.game_id, p.team_code, p.player_id, 'confirmed', p.scraped_at "
+        "from lineup_snapshots p join games g using (game_id) "
+        "where p.snapshot_type = 'preliminary' and g.playoff = false and g.date < %s and g.date >= %s "
+        "and not exists (select 1 from lineup_snapshots c where c.game_id = p.game_id and c.team_code = p.team_code "
+        "and c.snapshot_type = 'confirmed') on conflict do nothing")
+    goalie_sql = (
+        "insert into goalie_snapshots (game_id, team_code, player_id, snapshot_type, scraped_at, dfo_status) "
+        "select p.game_id, p.team_code, p.player_id, 'confirmed', p.scraped_at, p.dfo_status "
+        "from goalie_snapshots p join games g using (game_id) "
+        "where p.snapshot_type = 'preliminary' and g.playoff = false and g.date < %s and g.date >= %s "
+        "and not exists (select 1 from goalie_snapshots c where c.game_id = p.game_id and c.team_code = p.team_code "
+        "and c.snapshot_type = 'confirmed') on conflict do nothing")
+    conn = conn_factory()
+    try:
+        with conn.cursor() as cur:
+            if DRY_RUN:
+                for label, table in (("lineup", "lineup_snapshots"), ("goalie", "goalie_snapshots")):
+                    cur.execute(
+                        f"select count(distinct (p.game_id, p.team_code)) from {table} p join games g using (game_id) "
+                        "where p.snapshot_type = 'preliminary' and g.playoff = false and g.date < %s and g.date >= %s "
+                        f"and not exists (select 1 from {table} c where c.game_id = p.game_id and "
+                        "c.team_code = p.team_code and c.snapshot_type = 'confirmed')", (today, cutoff))
+                    print(f"[dry-run] would freeze {cur.fetchone()[0]} team-game(s) of {label} snapshots")
+                return
+            cur.execute(lineup_sql, (today, cutoff))
+            n_l = cur.rowcount
+            cur.execute(goalie_sql, (today, cutoff))
+            n_g = cur.rowcount
+        conn.commit()
+        print(f"[live] freeze_missed: copied {n_l} lineup row(s) and {n_g} goalie row(s) to 'confirmed'.")
     finally:
         conn.close()
 
@@ -564,14 +584,18 @@ def main():
     if not os.environ.get("PGHOST"):
         print("No PGHOST set -- nothing to do.")
         return
+    if RUN_MODE == "freeze_missed":
+        freeze_missed(get_db_conn, today)
+        print("Done.")
+        return
     conn = get_db_conn()
     try:
         queue_rows = []
-        lineup_rows = lineup_snapshot_pass(conn, today, queue_rows)
+        lineup_rows, lineup_replace = lineup_snapshot_pass(conn, today, queue_rows)
         goalie_rows = goalie_snapshot_pass(conn, today, queue_rows)
     finally:
         conn.close()
-    write_snapshots(get_db_conn, "lineup_snapshots", lineup_rows)
+    write_snapshots(get_db_conn, "lineup_snapshots", lineup_rows, lineup_replace)
     write_snapshots(get_db_conn, "goalie_snapshots", goalie_rows)
     write_review_queue(get_db_conn, queue_rows)
     print("Done.")

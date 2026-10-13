@@ -49,8 +49,9 @@ game up by its stored date) could not find it. This script now fixes that up fro
 SAFETY
 ------
 - DRY_RUN defaults to true -- prints what it would POST instead of POSTing.
-- The ONLY thing this script ever writes is `games.date` for a game it has confirmed was moved (see MOVED
-  GAMES), and only for a row that is still unplayed. DRY_RUN prints the change instead of making it.
+- It writes only two things: `games.date` for a game it has confirmed was moved (see MOVED GAMES, only for a row
+  that is still unplayed), and `games.start_time` (ESPN puck drop) for every game it schedules -- the lineup/goalie
+  ingest uses start_time to stop live-refreshing a game once it has started. DRY_RUN prints instead of writing.
 - Skips any event ESPN doesn't have a real start time for yet, and any
   event that already started (Worker alarms firing on already-passed times
   fire almost immediately, which is a harmless catch-up, but there is no
@@ -189,6 +190,17 @@ def redate_game(conn, game_id, old_date, new_date):
     return n == 1
 
 
+def set_start_time(conn, game_id, start_dt):
+    """Record ESPN's puck-drop time on games.start_time (idempotent; a later run picks up a changed time)."""
+    if DRY_RUN:
+        print(f"  [dry-run] would set games.start_time for {game_id} = {start_dt.isoformat()}")
+        return
+    with conn.cursor() as cur:
+        cur.execute("update games set start_time = %s where game_id = %s and start_time is distinct from %s",
+                    (start_dt, game_id, start_dt))
+    conn.commit()
+
+
 def schedule_worker_alarm(game_id, start_time_iso):
     """POST {game_id, start_time_iso} to the Worker's /schedule endpoint.
     Returns (ok, detail) -- never raises, so one bad game doesn't stop the rest."""
@@ -257,6 +269,7 @@ def main():
                 redated += 1
                 game_id = moved_id
             start_iso = e["start"].isoformat().replace("+00:00", "Z")
+            set_start_time(conn, game_id, e["start"])
             ok, detail = schedule_worker_alarm(game_id, start_iso)
             status = "OK" if ok else "FAILED"
             print(f"  {e['away']} @ {e['home']} ({game_id}) start={start_iso}: {status} -- {detail}")

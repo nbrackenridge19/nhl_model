@@ -106,6 +106,39 @@ def et_today():
         return (datetime.now(timezone.utc) - timedelta(hours=5)).date()
 
 
+def to_et(dt):
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        return dt.astimezone(timezone(timedelta(hours=-5)))
+
+
+def fmt_clock(dt):
+    """'2:03 PM' (12-hour, no leading zero), Eastern."""
+    return to_et(dt).strftime("%I:%M %p").lstrip("0")
+
+
+def fmt_scraped(dt):
+    """'7:33 AM' if scraped today (ET), else 'Oct 11, 2:15 AM'."""
+    e = to_et(dt)
+    if e.date() == et_today():
+        return fmt_clock(dt)
+    return f"{e.strftime('%b')} {e.day}, {fmt_clock(dt)}"
+
+
+def pick_snap(by_type, signal_snap):
+    """Which snapshot a cell shows: the signal's own type if present, else confirmed, else preliminary."""
+    return signal_snap if signal_snap in by_type else (
+        "confirmed" if "confirmed" in by_type else ("preliminary" if "preliminary" in by_type else None))
+
+
+def scraped_note(dt, show):
+    if dt is None or not show:
+        return ""
+    return f"<br><span class=\"tag\" style=\"font-size:11px;\">as of {fmt_scraped(dt)}</span>"
+
+
 # --------------------------- header ---------------------------
 
 def get_current_model_version(conn):
@@ -190,24 +223,30 @@ def get_goalie_data(conn, game_ids):
         return goalies
     with conn.cursor() as cur:
         cur.execute("""
-            select gs.game_id, gs.team_code, gs.snapshot_type, p.player_name_display, gs.dfo_status
+            select gs.game_id, gs.team_code, gs.snapshot_type, p.player_name_display, gs.dfo_status, gs.scraped_at
             from goalie_snapshots gs
             join players p on p.player_id = gs.player_id
             where gs.game_id = any(%s)""", (list(game_ids),))
-        for gid, team, stype, name, status in cur.fetchall():
-            goalies.setdefault((gid, team), {})[stype] = {"name": name, "status": status}
+        for gid, team, stype, name, status, scraped in cur.fetchall():
+            goalies.setdefault((gid, team), {})[stype] = {"name": name, "status": status, "scraped": scraped}
     return goalies
 
 
-def goalie_cell(game_id, team, signal_snap, goalie_data):
+def goalie_scraped_at(game_id, team, signal_snap, goalie_data):
     by_type = goalie_data.get((game_id, team), {})
-    snap = signal_snap if signal_snap in by_type else (
-        "confirmed" if "confirmed" in by_type else ("preliminary" if "preliminary" in by_type else None))
+    snap = pick_snap(by_type, signal_snap)
+    return by_type[snap]["scraped"] if snap else None
+
+
+def goalie_cell(game_id, team, signal_snap, goalie_data, show_time=True):
+    by_type = goalie_data.get((game_id, team), {})
+    snap = pick_snap(by_type, signal_snap)
     if snap is None:
         return "<td class=\"tag\">no goalie yet</td>"
     g = by_type[snap]
-    label = g["status"] or snap
-    return f"<td>{g['name']} <span class=\"tag\">({label})</span></td>"
+    # Exactly what DailyFaceoff publishes (Confirmed / Likely / blank = Unconfirmed). Never our own snapshot type.
+    label = (g["status"] or "").strip().title() or "Unconfirmed"
+    return f"<td>{g['name']} <span class=\"tag\">({label})</span>{scraped_note(g['scraped'], show_time)}</td>"
 
 
 def get_skater_check_data(conn, game_ids):
@@ -225,7 +264,14 @@ def get_skater_check_data(conn, game_ids):
                 where game_id = any(%s)
                 group by 1, 2, 3""", (list(game_ids),))
             for gid, team, stype, n, n_null, names in cur.fetchall():
-                snaps.setdefault((gid, team), {})[stype] = {"n": n, "n_null": n_null, "names": names or []}
+                snaps.setdefault((gid, team), {})[stype] = {"n": n, "n_null": n_null, "names": names or [],
+                                                            "scraped": None}
+            cur.execute("""
+                select game_id, team_code, snapshot_type, max(scraped_at)
+                from lineup_snapshots where game_id = any(%s) group by 1, 2, 3""", (list(game_ids),))
+            for gid, team, stype, scraped in cur.fetchall():
+                if stype in snaps.get((gid, team), {}):
+                    snaps[(gid, team)][stype]["scraped"] = scraped
     with conn.cursor() as cur:
         cur.execute("select team_code, player_name_display, reason from player_id_review_queue where status = 'open'")
         for team, name, reason in cur.fetchall():
@@ -233,10 +279,15 @@ def get_skater_check_data(conn, game_ids):
     return snaps, queue
 
 
-def skater_check_cell(game_id, team, signal_snap, snaps, queue):
+def skater_scraped_at(game_id, team, signal_snap, snaps):
     by_type = snaps.get((game_id, team), {})
-    snap = signal_snap if signal_snap in by_type else (
-        "confirmed" if "confirmed" in by_type else ("preliminary" if "preliminary" in by_type else None))
+    snap = pick_snap(by_type, signal_snap)
+    return by_type[snap]["scraped"] if snap else None
+
+
+def skater_check_cell(game_id, team, signal_snap, snaps, queue, show_time=True):
+    by_type = snaps.get((game_id, team), {})
+    snap = pick_snap(by_type, signal_snap)
     open_q = queue.get(team, [])
     if snap is None:
         if open_q:
@@ -255,8 +306,10 @@ def skater_check_cell(game_id, team, signal_snap, snaps, queue):
     if n != 18 and not issues:
         issues.append(f"DailyFaceoff lists only {n} skaters (no unmatched players, so likely genuine)")
     if not issues:
-        return f"<td style=\"color:#1a7f37;\">{n}/18 <span class=\"tag\">({snap})</span></td>"
-    text = f"{n}/18 <span class=\"tag\">({snap})</span><br>" + "<br>".join(issues)
+        return (f"<td style=\"color:#1a7f37;\">{n}/18 <span class=\"tag\">({snap})</span>"
+                f"{scraped_note(d['scraped'], show_time)}</td>")
+    text = (f"{n}/18 <span class=\"tag\">({snap})</span>{scraped_note(d['scraped'], show_time)}<br>"
+            + "<br>".join(issues))
     if fixable:
         text += f"<br><span class=\"tag\">run {ADD_PLAYER_CMD}</span>"
     return f"<td style=\"color:#b7791f;\">{text}</td>"
@@ -718,6 +771,24 @@ def render_todays_games(rows, skater_data=None, goalie_data=None, bankroll=None)
         return "<p class=\"meta\">No games scheduled today.</p>"
     snaps, queue = skater_data if skater_data else ({}, {})
     goalie_data = goalie_data or {}
+    # Freshness: per-cell "as of" by default; if every row shares one scrape time (to the minute) it is shown
+    # once above the table instead.
+    g_times, s_times = [], []
+    for (game_id, home, away, _f1, _s1, _m1, _l1, h_snap, _f2, _s2, _m2, _l2, a_snap) in rows:
+        for team, snap in ((home, h_snap), (away, a_snap)):
+            g_times.append(goalie_scraped_at(game_id, team, snap, goalie_data))
+            s_times.append(skater_scraped_at(game_id, team, snap, snaps))
+
+    def uniform(times):
+        known = {t.replace(second=0, microsecond=0) for t in times if t is not None}
+        return len(known) == 1 and all(t is not None for t in times)
+    g_uniform, s_uniform = uniform(g_times), uniform(s_times)
+    notes = []
+    if g_uniform:
+        notes.append(f"Goalies as of {fmt_scraped(g_times[0])}")
+    if s_uniform:
+        notes.append(f"Lineups as of {fmt_scraped(s_times[0])}")
+    top_note = f"<p class=\"meta\">{' &middot; '.join(notes)} (last DailyFaceoff read)</p>" if notes else ""
     html = ""
     for (game_id, home, away, h_fire, h_stake, h_mpct, h_mlpct, h_snap,
          a_fire, a_stake, a_mpct, a_mlpct, a_snap) in rows:
@@ -728,8 +799,8 @@ def render_todays_games(rows, skater_data=None, goalie_data=None, bankroll=None)
             (away, home, False, a_fire, a_stake, a_mpct, a_mlpct, a_snap),
         ):
             row_cls = "team-top" if is_home else "game-end"
-            check_td = skater_check_cell(game_id, team, snap, snaps, queue)
-            goalie_td = goalie_cell(game_id, team, snap, goalie_data)
+            check_td = skater_check_cell(game_id, team, snap, snaps, queue, show_time=not s_uniform)
+            goalie_td = goalie_cell(game_id, team, snap, goalie_data, show_time=not g_uniform)
             if mpct is None:
                 html += (
                     f"<tr class=\"{row_cls}\"><td>" + f"{away.upper()} @ {home.upper()}" + "</td>"
@@ -760,7 +831,7 @@ def render_todays_games(rows, skater_data=None, goalie_data=None, bankroll=None)
                 f"{check_td}"
                 "</tr>"
             )
-    return (
+    return top_note + (
         "<table class=\"today\"><tr><th>Matchup</th><th>Team</th><th>Bet?</th><th>$ Amount</th>"
         "<th>Model %</th><th>Market %</th><th>Delta</th><th>Goalie</th><th>Skater check</th></tr>"
         + html + "</table>"
@@ -945,7 +1016,7 @@ def render_html(model_version, bankroll, todays_rows, detail_season, week_groups
         "<h1>NHL Model Dashboard</h1>"
         f"<div class=\"meta\">Live bankroll: {bankroll_str} &middot; "
         f"Model version {model_version[0]} (effective {model_version[1]}) &middot; "
-        f"Updated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</div>"
+        f"Page rendered {fmt_clock(datetime.now(timezone.utc))} ET</div>"
         f"{callout_html}"
         "<h2>Today's games</h2>"
         f"{render_todays_games(todays_rows, skater_data, goalie_data, bankroll)}"
