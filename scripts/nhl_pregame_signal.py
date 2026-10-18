@@ -317,7 +317,10 @@ def prior_season_code(season):
 
 # --------------------------- freeze one game ---------------------------
 
-def build_signal_rows(conn, game_id, home, away, season, game_date):
+def build_signal_rows(conn, game_id, home, away, season, game_date, odds_override=None):
+    """odds_override: optional {team_code: (moneyline, vig_flag)}. Default None reads the frozen `odds` table
+    exactly as before (this is what the real freeze uses). The dashboard passes a live line here to show a
+    preview of the signal earlier in the day -- nothing is written by this function either way."""
     prior_season = prior_season_code(season)
     home_lineup_type = best_lineup_snapshot(conn, game_id, home)
     away_lineup_type = best_lineup_snapshot(conn, game_id, away)
@@ -360,7 +363,10 @@ def build_signal_rows(conn, game_id, home, away, season, game_date):
         (home, away, True, home_win_prob, features_home),
         (away, home, False, 1 - home_win_prob, {k: -v for k, v in features_home.items()}),
     ):
-        ml, vig_flag = moneyline_and_vig(conn, game_id, team_code)
+        if odds_override is not None:
+            ml, vig_flag = odds_override.get(team_code, (None, None))
+        else:
+            ml, vig_flag = moneyline_and_vig(conn, game_id, team_code)
         if ml is None:
             return None, f"no odds row for {team_code}"
         mlpct = mlpct_from_moneyline(ml)

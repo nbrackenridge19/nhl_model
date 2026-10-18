@@ -24,7 +24,8 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install psycopg2-binary
+        # requests + beautifulsoup4: the live-odds preview imports the odds / pregame-signal scripts.
+        run: pip install psycopg2-binary requests beautifulsoup4
 
       - name: Generate dashboard
         env:

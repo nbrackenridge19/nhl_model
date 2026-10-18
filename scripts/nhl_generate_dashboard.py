@@ -85,11 +85,19 @@ workflow then commits only if the content actually changed.
 
 import math
 import os
+import sys
 from datetime import date, datetime, timedelta, timezone
 
 import psycopg2
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 OUTPUT_PATH = "docs/index.html"
+
+# Right-hand (LogLoss delta) axis of the wallet chart: fixed, because early-season variability otherwise
+# stretches the scale and hides the trend. Values outside the range are clipped at the panel edge.
+LL_DELTA_AXIS_HALF_RANGE = 0.005
+LL_DELTA_AXIS_STEP = 0.001
 
 
 def get_db_conn():
@@ -207,6 +215,81 @@ def get_todays_games(conn):
             order by g.game_id
         """, (today,))
         return cur.fetchall()
+
+
+def get_todays_schedule_and_preview(conn, rows):
+    """Game start times plus a PREVIEW of the signal for games with no frozen bet_signals row yet.
+
+    Start times come from ESPN's scoreboard (the games table only has a date). The preview uses the current
+    DraftKings line (read live from ESPN, or from the `odds` table if the T-5 capture already wrote it) with
+    the same model math the T-5 freeze uses (nhl_pregame_signal.build_signal_rows), fed the best lineup/goalie
+    snapshots captured so far. NOTHING is written: the frozen T-5 signal still replaces the preview when it
+    arrives. Every step is best-effort -- a failure just means no time / no preview, never a broken page.
+
+    Returns (start_times, preview, odds_asof):
+      start_times -- {game_id: tz-aware UTC datetime}
+      preview     -- {(game_id, team): {"fire", "stake", "mpct", "mlpct", "model_ok"}}; mpct is None when the
+                     lineup/goalie data needed for the model number is not captured yet (market % still shown)
+      odds_asof   -- when the live lines were read (datetime) or None"""
+    start_times, preview, odds_asof = {}, {}, None
+    if not rows:
+        return start_times, preview, odds_asof
+    try:
+        import nhl_odds_ingest as oi
+        events = {(e["home"], e["away"]): e for e in oi.fetch_scoreboard(et_today())}
+    except Exception as e:  # noqa: BLE001
+        print(f"ESPN scoreboard unavailable -- no game times / preview odds this run: {e}")
+        return start_times, preview, odds_asof
+
+    for r in rows:
+        ev = events.get((r[1], r[2]))
+        if ev and ev["start"]:
+            start_times[r[0]] = ev["start"]
+
+    try:
+        import nhl_pregame_signal as ps
+    except Exception as e:  # noqa: BLE001
+        print(f"Preview model unavailable -- showing times only: {e}")
+        return start_times, preview, odds_asof
+
+    with conn.cursor() as cur:
+        cur.execute("select game_id, season from games where game_id = any(%s)", ([r[0] for r in rows],))
+        seasons = dict(cur.fetchall())
+
+    for (game_id, home, away, _f1, _s1, h_mpct, _l1, _h_snap, _f2, _s2, a_mpct, _l2, _a_snap) in rows:
+        if h_mpct is not None and a_mpct is not None:
+            continue  # frozen signal exists -- the real thing is shown, no preview
+        try:
+            ev = events.get((home, away))
+            if ev is None or (ev["final"] or (ev["start"] and ev["start"] <= datetime.now(timezone.utc))):
+                continue  # not on ESPN, or already underway/finished -- the preview only covers pre-game
+            ml = {}
+            db_home, db_away = ps.moneyline_and_vig(conn, game_id, home), ps.moneyline_and_vig(conn, game_id, away)
+            if db_home[0] is not None and db_away[0] is not None:
+                ml = {home: db_home, away: db_away}
+            else:
+                home_ml, away_ml = oi.fetch_draftkings_moneylines(ev["event_id"], ev["comp_id"])
+                if home_ml is None or away_ml is None:
+                    continue
+                _vig, flag = oi.vig_from_moneylines(home_ml, away_ml)
+                ml = {home: (home_ml, flag), away: (away_ml, flag)}
+                odds_asof = datetime.now(timezone.utc)
+            season = seasons.get(game_id)
+            sig_rows, err = (None, "no season") if not season else \
+                ps.build_signal_rows(conn, game_id, home, away, season, et_today(), odds_override=ml)
+            if sig_rows is None:
+                print(f"  preview {away} @ {home}: market only ({err})")
+                for team in (home, away):
+                    preview[(game_id, team)] = {"fire": False, "stake": None, "mpct": None,
+                                                "mlpct": ps.mlpct_from_moneyline(ml[team][0]), "model_ok": False}
+                continue
+            for sr in sig_rows:
+                preview[(game_id, sr[1])] = {"fire": bool(sr[15]), "stake": float(sr[17]), "mpct": float(sr[9]),
+                                             "mlpct": float(sr[10]), "model_ok": True}
+        except Exception as e:  # noqa: BLE001
+            conn.rollback()
+            print(f"  preview {away} @ {home}: skipped ({e})")
+    return start_times, preview, odds_asof
 
 
 # --------------------------- skater check + attention callout ---------------------------
@@ -560,6 +643,7 @@ STYLE = (
     ".nested[open] summary::before { content: '\\25BE'; } "
     "table.today tr.team-top td { border-bottom: 1px dashed #aaa; } "
     "table.today tr.game-end td { border-bottom: 3px solid #8a8f98; } "
+    "table.today tr.team-top td.matchup { border-bottom: 3px solid #8a8f98; vertical-align: middle; } "
     "table.detail { border-radius: 0; margin: 0; box-shadow: none; } "
     "table.detail th, table.detail td { padding: 8px; white-space: nowrap; } "
     "@media (max-width: 480px) { th, td { font-size: 12px; padding: 8px 4px; } }"
@@ -644,7 +728,7 @@ def render_wallet_chart_svg(bank_days, ll_delta_series, start_bank, season_start
     Two stacked panels sharing one x axis that spans the FULL season (season_start..season_end); lines and
     bars stop at the last settled day.
       Top panel    -- in-year wallet $ (left axis, green; starts at the season's starting bankroll) and
-                      cumulative average LogLoss delta (right axis, purple). The dashed purple line is the
+                      cumulative average LogLoss delta (right axis, purple, fixed at -0.005..+0.005 and clipped). The dashed purple line is the
                       LL-delta zero line: below it the model has beaten the market, above it the market has
                       beaten the model.
       Bottom panel -- each day's total $ result (green up / red down).
@@ -702,10 +786,16 @@ def render_wallet_chart_svg(bank_days, ll_delta_series, start_bank, season_start
                    f'dominant-baseline="middle">${v:,.0f}</text>')
 
     # ---- top panel: LL delta (right) ----
-    delta_vals = [v for _, v in ll_delta_series] + [0.0]
-    d_lo, d_hi, d_ticks, d_step = _nice_axis(min(delta_vals), max(delta_vals), min_span=0.02)
+    # Fixed range (see LL_DELTA_AXIS_*): early-season swings would otherwise blow the scale out. Anything outside
+    # the range is clipped at the panel edge by the clipPath below.
+    d_step = LL_DELTA_AXIS_STEP
+    d_lo, d_hi = -LL_DELTA_AXIS_HALF_RANGE, LL_DELTA_AXIS_HALF_RANGE
+    n_d = int(round((d_hi - d_lo) / d_step))
+    d_ticks = [round(d_lo + i * d_step, 10) for i in range(n_d + 1)]
     y_d = y_mapper(p1_top, p1_h, d_lo, d_hi)
-    decimals = 3 if d_step >= 0.001 else 4
+    decimals = 3
+    svg.append(f'<defs><clipPath id="ll-clip"><rect x="{left}" y="{p1_top}" width="{plot_w}" height="{p1_h}" />'
+               f'</clipPath></defs>')
     svg.append(f'<line x1="{left + plot_w}" x2="{left + plot_w}" y1="{p1_top}" y2="{p1_top + p1_h}" '
                f'stroke="{AXIS}" />')
     for v in d_ticks:
@@ -725,7 +815,8 @@ def render_wallet_chart_svg(bank_days, ll_delta_series, start_bank, season_start
     svg.append('<polyline points="' + " ".join(f"{x_of(d):.1f},{y_w(v):.1f}" for d, v in wallet_pts) +
                '" fill="none" stroke="#1a7f37" stroke-width="2" />')
     if ll_delta_series:
-        svg.append('<polyline points="' + " ".join(f"{x_of(d):.1f},{y_d(v):.1f}" for d, v in ll_delta_series) +
+        svg.append('<polyline clip-path="url(#ll-clip)" points="' +
+                   " ".join(f"{x_of(d):.1f},{y_d(v):.1f}" for d, v in ll_delta_series) +
                    '" fill="none" stroke="#6a3fb5" stroke-width="2" />')
 
     # ---- bottom panel: daily result bars ----
@@ -766,7 +857,8 @@ def render_wallet_chart_svg(bank_days, ll_delta_series, start_bank, season_start
     return "".join(svg)
 
 
-def render_todays_games(rows, skater_data=None, goalie_data=None, bankroll=None):
+def render_todays_games(rows, skater_data=None, goalie_data=None, bankroll=None, start_times=None,
+                        preview=None, odds_asof=None):
     if not rows:
         return "<p class=\"meta\">No games scheduled today.</p>"
     snaps, queue = skater_data if skater_data else ({}, {})
@@ -789,44 +881,72 @@ def render_todays_games(rows, skater_data=None, goalie_data=None, bankroll=None)
     if s_uniform:
         notes.append(f"Lineups as of {fmt_scraped(s_times[0])}")
     top_note = f"<p class=\"meta\">{' &middot; '.join(notes)} (last DailyFaceoff read)</p>" if notes else ""
+    start_times, preview = start_times or {}, preview or {}
+    if preview:
+        asof = f" Live odds as of {fmt_scraped(odds_asof)}." if odds_asof else ""
+        top_note += ("<p class=\"meta\">Rows tagged <b>prelim</b> use the current DraftKings line and the lineups/"
+                     "goalies captured so far, and refresh with each page update; the frozen signal replaces "
+                     f"them at T-5.{asof}</p>")
     html = ""
     for (game_id, home, away, h_fire, h_stake, h_mpct, h_mlpct, h_snap,
          a_fire, a_stake, a_mpct, a_mlpct, a_snap) in rows:
-        # Home row first, away row second (unchanged order). A dashed rule separates the two teams in a game
-        # (first row = team-top); a thick rule closes out the game (second row = game-end).
+        # Home row first, away row second. The matchup cell (with the game time beneath) spans both rows, so it
+        # is only emitted on the first. A dashed rule separates the two teams; a thick rule closes out the game.
+        t0 = start_times.get(game_id)
+        matchup_td = (f"<td class=\"matchup\" rowspan=\"2\">{away.upper()} @ {home.upper()}"
+                      + (f"<br><span class=\"tag\" style=\"font-size:12px;\">{fmt_clock(t0)}</span>" if t0 else "")
+                      + "</td>")
         for team, opp, is_home, fire, stake, mpct, mlpct, snap in (
             (home, away, True, h_fire, h_stake, h_mpct, h_mlpct, h_snap),
             (away, home, False, a_fire, a_stake, a_mpct, a_mlpct, a_snap),
         ):
             row_cls = "team-top" if is_home else "game-end"
+            lead_td = matchup_td if is_home else ""
             check_td = skater_check_cell(game_id, team, snap, snaps, queue, show_time=not s_uniform)
             goalie_td = goalie_cell(game_id, team, snap, goalie_data, show_time=not g_uniform)
-            if mpct is None:
+            pv = preview.get((game_id, team)) if mpct is None else None
+            if mpct is None and pv is None:
                 html += (
-                    f"<tr class=\"{row_cls}\"><td>" + f"{away.upper()} @ {home.upper()}" + "</td>"
+                    f"<tr class=\"{row_cls}\">{lead_td}"
                     f"<td>{team.upper()} {'(H)' if is_home else '(A)'}</td>"
                     "<td colspan=\"5\" class=\"tag\">awaiting odds/lineup data -- no signal yet</td>"
                     f"{goalie_td}{check_td}</tr>"
                 )
                 continue
-            mpct, mlpct = float(mpct), float(mlpct)
-            delta = mpct - mlpct
-            delta_color = "#1a7f37" if delta > 0 else ("#c0392b" if delta < 0 else "#666")
-            bet_str = "BET" if fire else "no"
-            bet_color = "#1a7f37" if fire else "#666"
+            is_prelim = pv is not None
+            if is_prelim:
+                fire, stake, mpct, mlpct = pv["fire"], pv["stake"], pv["mpct"], pv["mlpct"]
+                snap_tag = "prelim odds"
+                prelim_tag = " <span class=\"tag\">(prelim)</span>"
+            else:
+                snap_tag, prelim_tag = snap, ""
+            mlpct = float(mlpct)
+            if mpct is None:  # preview with market line only (lineup/goalie not captured yet)
+                model_str, delta_str = "-", "-"
+                delta_color = "#666"
+            else:
+                mpct = float(mpct)
+                delta = mpct - mlpct
+                delta_color = "#1a7f37" if delta > 0 else ("#c0392b" if delta < 0 else "#666")
+                model_str, delta_str = f"{mpct:.1%}", f"{delta:+.1%}"
+            if is_prelim and mpct is None:
+                bet_html = "<span class=\"tag\">-</span>"
+            else:
+                bet_str = "BET" if fire else "no"
+                bet_color = "#1a7f37" if fire else "#666"
+                bet_html = f"<span style=\"color:{bet_color}; font-weight:600;\">{bet_str}</span>{prelim_tag}"
             # stake is a FRACTION of bankroll (bet_signals.stake_fraction) -> dollars off the in-year bank
             stake_str = (f"${float(stake) * bankroll:,.0f}"
                          if fire and stake is not None and bankroll is not None else "-")
             html += (
-                f"<tr class=\"{row_cls}\">"
-                f"<td>{away.upper()} @ {home.upper()}</td>"
+                f"<tr class=\"{row_cls}\">{lead_td}"
                 f"<td>{team.upper()} {'(H)' if is_home else '(A)'} "
-                f"<span class=\"tag\">({snap})</span></td>"
-                f"<td><span style=\"color:{bet_color}; font-weight:600;\">{bet_str}</span></td>"
+                f"<span class=\"tag\">({snap_tag})</span></td>"
+                f"<td>{bet_html}</td>"
                 f"<td>{stake_str}</td>"
-                f"<td>{mpct:.1%}</td>"
+                f"<td>{model_str}</td>"
                 f"<td>{mlpct:.1%}</td>"
-                f"<td style=\"color:{delta_color}; font-weight:600;\">{delta:+.1%}</td>"
+                f"<td style=\"color:{delta_color}; font-weight:600;\">{delta_str}</td>"
                 f"{goalie_td}"
                 f"{check_td}"
                 "</tr>"
@@ -968,7 +1088,8 @@ def render_nested_drilldown(groups_sorted, label_fn, all_pairs_by_game_id):
 
 def render_html(model_version, bankroll, todays_rows, detail_season, week_groups, team_groups,
                 season_summaries, pairs_by_game_id, wallet_returns, detail_season_summary, chart_svg,
-                skater_data=None, callout_html="", goalie_data=None, yesterday_html="", yesterday_label=""):
+                skater_data=None, callout_html="", goalie_data=None, yesterday_html="", yesterday_label="",
+                start_times=None, preview=None, odds_asof=None):
     season_disp = f"{detail_season[:2]}-{detail_season[2:]}"
 
     week_html = render_nested_drilldown(week_groups, lambda k: f"Week {k}", pairs_by_game_id)
@@ -1019,7 +1140,7 @@ def render_html(model_version, bankroll, todays_rows, detail_season, week_groups
         f"Page rendered {fmt_clock(datetime.now(timezone.utc))} ET</div>"
         f"{callout_html}"
         "<h2>Today's games</h2>"
-        f"{render_todays_games(todays_rows, skater_data, goalie_data, bankroll)}"
+        f"{render_todays_games(todays_rows, skater_data, goalie_data, bankroll, start_times, preview, odds_asof)}"
         f"<h2>{season_disp} at a glance</h2>"
         f"{summary_table_html('Season', detail_row_html)}"
         f"<h2>{season_disp} &mdash; wallet &amp; LogLoss over time</h2>"
@@ -1052,6 +1173,10 @@ def main():
 
         todays_rows = get_todays_games(conn)
         print(f"Today's games: {len(todays_rows)}")
+        start_times, preview, odds_asof = get_todays_schedule_and_preview(conn, todays_rows)
+        # Earliest puck drop first (game_id order otherwise); games with no known time keep game_id order at the end.
+        _far = datetime.max.replace(tzinfo=timezone.utc)
+        todays_rows = sorted(todays_rows, key=lambda r: (start_times.get(r[0], _far), r[0]))
         skater_data = get_skater_check_data(conn, [r[0] for r in todays_rows])
         goalie_data = get_goalie_data(conn, [r[0] for r in todays_rows])
         callout_html = render_attention_callout(*get_attention_callout(conn))
@@ -1102,7 +1227,8 @@ def main():
         f.write(render_html(model_version, bankroll, todays_rows, detail_season,
                             week_groups, team_groups, season_summaries, pairs_by_game_id,
                             wallet_returns, detail_season_summary, chart_svg,
-                            skater_data, callout_html, goalie_data, yesterday_html, yesterday_label))
+                            skater_data, callout_html, goalie_data, yesterday_html, yesterday_label,
+                            start_times, preview, odds_asof))
     print(f"Dashboard written to {OUTPUT_PATH}")
 
 
