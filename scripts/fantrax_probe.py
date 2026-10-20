@@ -26,17 +26,65 @@ EXIT CODES: 0 = everything worked, 1 = Fantrax rejected or errored, 2 = setup.
 import os
 import sys
 import time
+import traceback
 from collections import Counter
+from datetime import datetime
 
 import requests
-from fantraxapi import League
+from fantraxapi import League, api
 from fantraxapi.exceptions import FantraxException, NotLoggedIn, NotMemberOfLeague
+from fantraxapi.objs.position import Position
+from fantraxapi.objs.scoring_period import ScoringPeriod
+from fantraxapi.objs.status import Status
 
 REQUEST_DELAY_SECONDS = 0.5
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
+
+
+class TolerantLeague(League):
+    """fantraxapi 1.0.1 crashes with KeyError (e.g. 'Sep 29') when the league's
+    list of scoring dates contains a date missing from the roster page's
+    period dropdown. Same logic as League.reset_info, but such dates are
+    skipped and recorded instead of raising."""
+
+    skipped_dates: list = []
+
+    def reset_info(self) -> None:
+        responses = api.get_init_info(self)
+        self.name = responses[0]["fantasySettings"]["leagueName"]
+        self.year = responses[0]["fantasySettings"]["subtitle"]
+        self.start_date = datetime.fromtimestamp(responses[0]["fantasySettings"]["season"]["startDate"] / 1e3)
+        self.end_date = datetime.fromtimestamp(responses[0]["fantasySettings"]["season"]["endDate"] / 1e3)
+        self.positions = {k: Position(self, v) for k, v in responses[0]["positionMap"].items()}
+        self.status = {k: Status(self, v) for k, v in responses[1]["allObjs"].items() if "name" in v}
+        period_to_day_list = {}
+        for s in responses[4]["displayedLists"]["periodList"]:
+            period, s = s.split(" ", maxsplit=1)
+            period_to_day_list[s[5:-1]] = int(period)
+        self.scoring_dates = {}
+        self.skipped_dates = []
+        for day in responses[2]["dates"]:
+            scoring_date = datetime.strptime(day["object1"], "%Y-%m-%d").date()
+            key = scoring_date.strftime("%b %d")
+            if "0" in key and not key.endswith("0"):
+                key = key.replace("0", "")
+            if key not in period_to_day_list:
+                self.skipped_dates.append(key)
+                continue
+            self.scoring_dates[period_to_day_list[key]] = scoring_date
+        self.scoring_periods = {p["value"]: ScoringPeriod(self, p)
+                                for p in responses[3]["displayedLists"]["scoringPeriodList"] if p["name"] != "Full Season"}
+        self._scoring_periods_lookup = None
+        self._update_teams(responses[3]["fantasyTeams"])
+
+
+def where(e: Exception) -> str:
+    """Last stack frame as file:line -- tells us where a failure happened without echoing request data."""
+    tb = traceback.extract_tb(e.__traceback__)
+    return f"{os.path.basename(tb[-1].filename)}:{tb[-1].lineno} in {tb[-1].name}" if tb else "unknown"
 
 
 def main() -> int:
@@ -53,7 +101,7 @@ def main() -> int:
     session.headers.update({"Cookie": cookie, "User-Agent": USER_AGENT, "Accept": "application/json"})
 
     try:
-        league = League(league_id, session=session)
+        league = TolerantLeague(league_id, session=session)
     except NotLoggedIn:
         print("RESULT: Fantrax says NOT LOGGED IN. The cookie was rejected (expired, incomplete, or tied to another IP).")
         return 1
@@ -64,10 +112,14 @@ def main() -> int:
         print(f"RESULT: Fantrax error: {str(e)[:300]}")
         return 1
     except Exception as e:  # noqa: BLE001 - network errors, HTML instead of JSON, etc.
-        print(f"RESULT: request failed before Fantrax answered: {type(e).__name__}: {str(e)[:300]}")
+        print(f"RESULT: unexpected error (Fantrax may have answered; this can be a parsing problem): "
+              f"{type(e).__name__}: {str(e)[:200]} at {where(e)}")
         return 1
 
     print(f"OK league: {league.name} ({league.year}); teams: {len(league.teams)}")
+    if league.skipped_dates:
+        print(f"  note: {len(league.skipped_dates)} scoring dates not in the period list were skipped: "
+              f"{league.skipped_dates[:5]}")
 
     # Rosters for every team
     total_rows = 0
@@ -75,7 +127,7 @@ def main() -> int:
         try:
             roster = league.team_roster(team.id)
         except Exception as e:  # noqa: BLE001
-            print(f"  roster FAILED for team {team.id}: {type(e).__name__}: {str(e)[:150]}")
+            print(f"  roster FAILED for team {team.id}: {type(e).__name__}: {str(e)[:150]} at {where(e)}")
             return 1
         filled = sum(1 for r in roster.rows if r.player is not None)
         total_rows += filled
@@ -88,7 +140,7 @@ def main() -> int:
     try:
         txs = league.transactions(count=100)
     except Exception as e:  # noqa: BLE001
-        print(f"RESULT: transactions FAILED: {type(e).__name__}: {str(e)[:200]}")
+        print(f"RESULT: transactions FAILED: {type(e).__name__}: {str(e)[:200]} at {where(e)}")
         return 1
     type_counts = Counter(p.type for t in txs for p in t.players)
     print(f"OK transactions: {len(txs)} transaction sets; player-level type codes: {dict(type_counts)}")
