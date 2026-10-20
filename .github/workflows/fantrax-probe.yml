@@ -1,0 +1,31 @@
+name: Fantrax Probe (cookie check)
+
+# Manual, read-only check that a saved Fantrax login cookie works from a GitHub
+# runner. Reads rosters and transactions only. Does not touch the database.
+# Needs one repo secret: FANTRAX_COOKIE (the Cookie header copied from a
+# logged-in Fantrax request). Treat it like a password.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests fantraxapi
+
+      - name: Probe Fantrax
+        env:
+          FANTRAX_COOKIE: ${{ secrets.FANTRAX_COOKIE }}
+          FANTRAX_LEAGUE_ID: cbufqc8umo5xrjzu
+        run: python scripts/fantrax_probe.py
