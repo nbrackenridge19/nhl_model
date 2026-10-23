@@ -1,5 +1,6 @@
 """
-fantrax_probe.py (v3, no fantraxapi library) -- read-only diagnostic of what
+fantrax_probe.py (v4: adds a free-agent pool check and a Hockey-Reference season-page check)
+(v3, no fantraxapi library) -- read-only diagnostic of what
 Fantrax's own endpoint returns for this league, using the saved login cookie.
 
 WHY THIS VERSION
@@ -28,6 +29,9 @@ import sys
 import time
 import traceback
 from collections import Counter
+
+import re
+import subprocess
 
 import requests
 
@@ -177,6 +181,93 @@ def main():
         if not rows:
             raise FxError("no transaction rows returned")
     step("transaction history", transactions, results)
+
+
+    # 6. Free-agent pool: can Fantrax list non-rostered players with Tk / Cor?
+    def fa_pool():
+        tried = []
+        variants = [
+            dict(statusOrTeamFilter="ALL_AVAILABLE", pageNumber=1, maxResultsPerPage=20),
+            dict(statusOrTeamFilter="ALL_AVAILABLE", pageNumber=1, maxResultsPerPage=20, view="STATS"),
+            dict(statusOrTeamFilter="ALL_AVAILABLE", positionOrGroup="ALL", pageNumber=1, maxResultsPerPage=20, view="STATS"),
+        ]
+        ok = False
+        for i, v in enumerate(variants, 1):
+            try:
+                d = call(s, league_id, "getPlayerStats", **v)
+            except Exception as e:  # noqa: BLE001
+                tried.append(f"variant {i}: {type(e).__name__}: {str(e)[:120]}")
+                continue
+            ok = True
+            print(f"  variant {i} worked: data keys: {sorted(d.keys())[:14]}")
+            tb = d.get("tableData") or d.get("table") or {}
+            hdr = [c.get("shortName") or c.get("name") for c in (tb.get("header", {}) or {}).get("cells", [])]
+            rows = tb.get("rows", [])
+            print(f"  columns: {hdr}")
+            print(f"  rows returned: {len(rows)}; paging: {str(d.get('paginatedResultSet') or d.get('pagination'))[:160]}")
+            for r in rows[:3]:
+                sc = r.get("scorer") or {}
+                cells = [c.get("content") for c in r.get("cells", [])]
+                print(f"  sample: {sc.get('name')} | {sc.get('teamShortName')} | {sc.get('posShortNames')} | status {r.get('statusId')} | cells {cells[:16]}")
+            break
+        for t in tried:
+            print("  " + t)
+        if not ok:
+            raise FxError("none of the free-agent query variants worked")
+    step("free-agent pool (Fantrax)", fa_pool, results)
+
+    # 7. Hockey-Reference season pages (what the workbook is built from)
+    def hr_pages():
+        try:
+            from bs4 import BeautifulSoup, Comment
+        except ImportError:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "beautifulsoup4"], check=True)
+            from bs4 import BeautifulSoup, Comment
+        hdrs = {"User-Agent": "Mozilla/5.0"}
+        pages = [
+            ("2026-27 standard", "https://www.hockey-reference.com/leagues/NHL_2027_skaters.html"),
+            ("2026-27 advanced", "https://www.hockey-reference.com/leagues/NHL_2027_skaters-advanced.html"),
+            ("2025-26 standard", "https://www.hockey-reference.com/leagues/NHL_2026_skaters.html"),
+            ("2025-26 advanced", "https://www.hockey-reference.com/leagues/NHL_2026_skaters-advanced.html"),
+        ]
+        failures = 0
+        for label, url in pages:
+            time.sleep(4)  # Hockey-Reference allows ~20 requests/minute; stay well under
+            try:
+                r = requests.get(url, headers=hdrs, timeout=30)
+                print(f"  {label}: HTTP {r.status_code}, {len(r.content)} bytes")
+                r.raise_for_status()
+            except Exception as e:  # noqa: BLE001
+                failures += 1
+                print(f"  {label}: FAILED {type(e).__name__}: {str(e)[:120]}")
+                continue
+            soup = BeautifulSoup(r.content, "html.parser")
+            tables = list(soup.find_all("table"))
+            for c in soup.find_all(string=lambda t: isinstance(t, Comment)):
+                if "<table" in c:
+                    tables += BeautifulSoup(c, "html.parser").find_all("table")
+            for t in tables:
+                body = t.find("tbody")
+                rows = [tr for tr in (body.find_all("tr") if body else []) if "thead" not in (tr.get("class") or [])]
+                if len(rows) < 50:
+                    continue
+                first = rows[0]
+                stats = [(c.get("data-stat"), c.get_text(strip=True)) for c in first.find_all(["th", "td"])]
+                pid = None
+                for c in first.find_all(["th", "td"]):
+                    a = c.find("a", href=True)
+                    if a and "/players/" in a["href"]:
+                        pid = a["href"].split("/")[-1].replace(".html", "")
+                        break
+                    if c.get("data-append-csv"):
+                        pid = c.get("data-append-csv")
+                        break
+                print(f"    table id={t.get('id')} rows={len(rows)} player id parsed: {pid}")
+                print(f"    data-stat columns: {[k for k, _ in stats]}")
+                print(f"    first row: {dict(stats)}")
+        if failures == len(pages):
+            raise FxError("no Hockey-Reference page could be fetched")
+    step("Hockey-Reference season pages", hr_pages, results)
 
     print("--- summary")
     for k, v in results.items():
