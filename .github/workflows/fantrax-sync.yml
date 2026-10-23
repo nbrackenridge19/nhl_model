@@ -1,0 +1,58 @@
+name: Fantrax Roster Sync
+
+# Hourly check of the Fantrax league "Dynasty Puck": pulls every roster and the
+# transaction history, records adds / drops / trades / slot moves in the
+# fantasy schema. Read-only against Fantrax.
+#
+# Needs repo secrets: FANTRAX_COOKIE (login cookie; if this workflow starts
+# failing with "cookie rejected", paste a fresh one) plus the same PG* secrets
+# the other workflows use.
+#
+# Manual runs default to dry-run (prints what it would write). Scheduled runs
+# are live, matching the other cron workflows.
+
+on:
+  schedule:
+    - cron: '15 * * * *'   # hourly at :15
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (true = no DB writes)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+concurrency:
+  group: fantrax-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests psycopg2-binary
+
+      - name: Sync Fantrax rosters
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGPORT: ${{ secrets.PGPORT }}
+          FANTRAX_COOKIE: ${{ secrets.FANTRAX_COOKIE }}
+          FANTRAX_LEAGUE_ID: cbufqc8umo5xrjzu
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: python scripts/fantrax_sync.py
