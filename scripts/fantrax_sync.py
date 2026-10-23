@@ -392,6 +392,17 @@ def main():
             return 0
         tx_new = write_all(conn, teams, roster, txs, events, seeded, run_started)
         print(f"[live] wrote {len(events)} event(s), refreshed {len(roster)} roster rows, {tx_new} new transaction row(s).")
+        # Best effort: link any newly seen Fantrax players to Hockey-Reference ids.
+        # A failure here must never fail the sync, so it is isolated.
+        try:
+            with conn.cursor() as cur:
+                cur.execute("select fantasy.link_players()")
+                linked = cur.fetchone()[0]
+            conn.commit()
+            print(f"[live] linked {linked} new player(s) to Hockey-Reference ids.")
+        except Exception as e:  # noqa: BLE001
+            conn.rollback()
+            print(f"[live] player linking skipped: {type(e).__name__}: {str(e)[:150]}")
         return 0
     finally:
         conn.close()
