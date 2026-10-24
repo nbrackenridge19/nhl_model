@@ -1,0 +1,81 @@
+name: Fantasy dashboard
+
+# Hourly: refresh Hockey-Reference season stats (skipped if refreshed < 3h ago), then rebuild
+# docs/fantasy/index.html from the database and commit it if it changed.
+# Reads only: fantasy.* tables (rosters, contracts, prospects) + fantasy.hr_season. No ScraperAPI credits.
+on:
+  schedule:
+    - cron: "40 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_stats:
+        description: "Re-fetch Hockey-Reference stats even if refreshed recently"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fantasy-dashboard
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install psycopg2-binary requests beautifulsoup4
+
+      - name: Refresh Hockey-Reference season stats
+        # A failed scrape must not stop the dashboard from rebuilding on the last good data.
+        continue-on-error: true
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGPORT: ${{ secrets.PGPORT }}
+        run: |
+          if [ "${{ github.event.inputs.force_stats }}" = "true" ]; then
+            python scripts/fantasy_hr_ingest.py --force
+          else
+            python scripts/fantasy_hr_ingest.py
+          fi
+
+      - name: Build dashboard
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGPORT: ${{ secrets.PGPORT }}
+        run: python scripts/fantasy_generate_dashboard.py
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/fantasy/index.html
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Update fantasy dashboard"
+          for i in 1 2 3 4 5; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push attempt $i rejected; rebasing onto latest main and retrying"
+            git pull --rebase -X theirs origin main || git rebase --abort || true
+            sleep $(( (RANDOM % 5) + 2 ))
+          done
+          echo "Failed to push after 5 attempts"
+          exit 1
