@@ -60,6 +60,14 @@ h3{font-size:14px;margin:14px 0 6px}
 .warn{color:var(--warn)}
 .bar{display:inline-block;height:8px;border-radius:2px;background:var(--accent);vertical-align:middle;opacity:.75}
 @media(max-width:700px){.sticky1{position:static}}
+.two.eq{grid-template-columns:1fr 1fr}
+@media(max-width:900px){.two.eq{grid-template-columns:1fr}}
+.pick{position:relative;margin-bottom:8px}.pick input{width:100%}
+.res{display:none;position:absolute;left:0;right:0;top:100%;z-index:6;background:var(--panel);border:1px solid var(--line);border-radius:6px;max-height:300px;overflow:auto;box-shadow:0 6px 18px rgba(0,0,0,.15)}
+.opt{padding:6px 10px;cursor:pointer;border-bottom:1px solid var(--line)}.opt:hover{background:var(--sel)}
+.mini{border:1px solid var(--line);background:var(--panel);color:var(--ink2);border-radius:5px;padding:1px 7px;cursor:pointer;font:inherit;font-size:12px}
+.mini:hover{border-color:var(--accent);color:var(--accent)}
+td input[type=number]{width:72px}
 </style>
 </head>
 <body>
@@ -85,7 +93,7 @@ const store = { get(k, d) { try { const v = localStorage.getItem('dp_' + k); ret
 const myIdx = Math.max(0, DATA.teams.findIndex((t) => t.name === DATA.myTeam));
 const S = { win: store.get('win', 'blend'), floor: store.get('floor', 10), pool: store.get('pool', 'sheet'), gpCat: store.get('gpCat', true),
             tab: store.get('tab', 'players'), team: store.get('team', myIdx), grp: 'ALL', owner: 'ALL', q: '',
-            sort: { k: 'tSAR', dir: -1 }, need: 'STP', limit: 300 };
+            sort: { k: 'tSAR', dir: -1 }, need: 'STP', limit: 300, ev: store.get('ev', {}) };
 const SKC = { F: SK_CATS_F, D: SK_CATS_D };
 const CAT_LABEL = { GP: 'GP', PTD: 'Pt-D', G: 'G', A: 'A', P2GA: '2G+A', PIM: 'PIM', SOG: 'SOG', STP: 'STP', Hit: 'Hit', Blk: 'Blk', TK: 'TK', Cor: 'Cor', W: 'W', GAA: 'GAA', SV: 'SV%', SHO: 'SHO' };
 const CAT_HELP = { G: 'goals', A: 'assists', P2GA: 'goals counted double + assists', PTD: 'defensemen points (G+A)', PIM: 'penalty minutes', SOG: 'shots on goal', STP: 'special-teams points (PPG+PPA+SHG+SHA)', Hit: 'hits', Blk: 'blocked shots', TK: 'takeaways', Cor: 'Corsi differential (CF-CA)', GP: 'games played (total)' };
@@ -126,7 +134,7 @@ function compute() {
     r.mkt = Number.isFinite(r.tSAR) && med[r.grp] > 0 ? Math.max(xlRound(r.tSAR / med[r.grp] * 1e6, -5), 1e6) : NaN;
     r.cv = r.aav != null && Number.isFinite(r.mkt) ? (r.mkt - r.aav) / r.mkt : NaN;
   }
-  C = { sk, gk, rows, P, PG, med };
+  C = { sk, gk, rows, P, PG, med, rowMap: new Map(rows.map((r) => [r.id, r])) };
   // team x category contribution (Active-slot skaters): sum of SAA per category
   C.team = DATA.teams.map(() => ({}));
   for (const r of sk) {
@@ -151,15 +159,15 @@ function drawControls() {
   $('#pool').onclick = (e) => { const v = e.target.dataset.v; if (v) { S.pool = v; store.set('pool', v); refresh(); } };
   $('#gpCat').onclick = (e) => { const v = e.target.dataset.v; if (v) { S.gpCat = v === 'true'; store.set('gpCat', S.gpCat); refresh(); } };
   $('#floor').onchange = (e) => { S.floor = Math.max(0, +e.target.value || 0); store.set('floor', S.floor); refresh(); };
-  $('#team').onchange = (e) => { S.team = +e.target.value; store.set('team', S.team); drawPanel(); };
+  $('#team').onchange = (e) => { S.team = +e.target.value; store.set('team', S.team); drawTabs(); drawPanel(); };
 }
-const TABS = [['players', 'Players'], ['needs', 'Team needs'], ['teams', 'Rosters'], ['cap', 'Cap'], ['prospects', 'Prospects'], ['changes', 'Recent changes'], ['method', 'Method & checks']];
+const TABS = [['players', 'Players'], ['needs', 'Team needs'], ['eval', 'Evaluator'], ['teams', 'Rosters'], ['cap', 'Cap'], ['prospects', 'Prospects'], ['changes', 'Recent changes'], ['method', 'Method & checks']];
 function drawTabs() {
-  $('#tabs').innerHTML = TABS.map(([k, l]) => `<button data-k="${k}" class="${S.tab === k ? 'on' : ''}">${l}</button>`).join('');
+  $('#tabs').innerHTML = TABS.map(([k, l]) => `<button data-k="${k}" class="${S.tab === k ? 'on' : ''}">${l}${k === 'eval' && evCount() ? ' (' + evCount() + ')' : ''}</button>`).join('');
   $('#tabs').onclick = (e) => { const k = e.target.dataset.k; if (k) { S.tab = k; store.set('tab', k); drawTabs(); drawPanel(); } };
 }
 function refresh() { compute(); drawControls(); drawPanel(); }
-function drawPanel() { ({ players: tabPlayers, needs: tabNeeds, teams: tabTeams, cap: tabCap, prospects: tabProspects, changes: tabChanges, method: tabMethod })[S.tab](); }
+function drawPanel() { ({ players: tabPlayers, needs: tabNeeds, eval: tabEval, teams: tabTeams, cap: tabCap, prospects: tabProspects, changes: tabChanges, method: tabMethod })[S.tab](); }
 
 /* ------------------------------------------------------------------ shared pieces */
 function legend() {
@@ -217,13 +225,13 @@ function tabPlayers() {
    <div class="note">${rows.length} players${unranked ? ` (${unranked} below the ${goalies ? Math.max(S.floor, G_MIN_GP) : S.floor}-game minimum shown unranked at the bottom)` : ''}. Click any column to sort - the category columns sort by that category's SAR.
    Free-agent replacement level: F median ≈ ${C.P.F.nRepl} players above ${C.P.F.threshold} GP, D ≈ ${C.P.D.nRepl} above ${C.P.D.threshold} GP.</div>
    <div class="tbl"><table id="ptbl"><thead><tr>
-     <th class="l">#</th><th class="l ${S.sort.k === 'name' ? 'on' : ''}" data-k="name">Player</th><th class="l">Pos</th><th class="l">NHL</th>
+     <th class="l">#</th><th></th><th class="l ${S.sort.k === 'name' ? 'on' : ''}" data-k="name">Player</th><th class="l">Pos</th><th class="l">NHL</th>
      <th data-k="age">Age</th><th class="l ${S.sort.k === 'owner' ? 'on' : ''}" data-k="owner">Owner</th><th data-k="aav">AAV</th>
      <th data-k="GP" class="${S.sort.k === 'GP' ? 'on' : ''}">GP</th>
      <th data-k="tSAR" class="${S.sort.k === 'tSAR' ? 'on' : ''}" title="sum of category SAR">tSAR${S.sort.k === 'tSAR' ? (S.sort.dir < 0 ? ' ▾' : ' ▴') : ''}</th>
      <th data-k="tSAA" title="sum of category SAA (vs. average)">tSAA</th><th data-k="perM" title="tSAR per $1M of AAV">SAR/$m</th><th data-k="mkt" title="market value implied by tSAR">Mkt $</th><th data-k="cv" title="(market - AAV) / market">Value</th>
      ${catHeaders(cats)}</tr></thead><tbody>
-     ${shown.map((r) => `<tr><td class="l dim">${ranks.get(r) || ''}</td><td class="l name">${esc(r.name)}</td><td class="l">${esc(r.p.pos || r.grp)}</td><td class="l dim">${esc(r.tm)}</td>
+     ${shown.map((r) => `<tr><td class="l dim">${ranks.get(r) || ''}</td><td class="l">${r.owner === S.team ? '' : `<button class="mini" data-ev="${esc(r.id)}" title="add to the Evaluator for the selected team">+</button>`}</td><td class="l name">${esc(r.name)}</td><td class="l">${esc(r.p.pos || r.grp)}</td><td class="l dim">${esc(r.tm)}</td>
        <td>${r.age ?? ''}</td><td class="l">${ownerPill(r)}</td><td>${r.aav != null ? money(r.aav) : '<span class="dim">$1M</span>'}</td><td>${r.GP}</td>
        <td><b>${f2(r.tSAR)}</b></td><td class="dim">${f2(r.tSAA)}</td><td>${f2(r.perM)}</td><td>${Number.isFinite(r.mkt) ? money(r.mkt) : ''}</td>
        <td class="${r.cv > 0.25 ? '' : 'dim'}">${Number.isFinite(r.cv) ? Math.round(r.cv * 100) + '%' : ''}</td>${catCells(r, cats)}</tr>`).join('')}
@@ -234,6 +242,7 @@ function tabPlayers() {
   $('#q').oninput = (e) => { S.q = e.target.value; clearTimeout(tabPlayers.t); tabPlayers.t = setTimeout(() => { tabPlayers(); const q = $('#q'); q.focus(); q.setSelectionRange(q.value.length, q.value.length); }, 200); };
   const m = $('#more'); if (m) m.onclick = () => { S.limit += 500; tabPlayers(); };
   hookSort($('#ptbl'), tabPlayers);
+  document.querySelectorAll('#ptbl [data-ev]').forEach((b) => (b.onclick = () => { if (evAdd(b.dataset.ev)) { b.textContent = '✓'; b.disabled = true; drawTabs(); } }));
 }
 
 /* ------------------------------------------------------------------ Team needs */
@@ -287,17 +296,18 @@ function tabTeams() {
 function tabCap() {
   const cap = DATA.cap, L = cap.labels, t = S.team, T = cap.teams[t];
   const col = (v) => `rgba(var(--${v >= 0 ? 'pos' : 'neg'}),${Math.min(Math.abs(v) / 60e6, 1) * 0.55})`;
-  const matrix = cap.teams.map((x, i) => `<tr class="${i === t ? 'need pick' : 'need'}" data-t="${i}"><td class="l name">${esc(DATA.teams[i].name)}</td>${L.map((_, y) => `<td style="background:${col(x.space[y])}">${money(x.space[y])}</td>`).join('')}<td class="dim">${money(x.real[0])}</td></tr>`).join('');
+  const matrix = cap.teams.map((x, i) => `<tr class="${i === t ? 'need pick' : 'need'}" data-t="${i}"><td class="l name">${esc(DATA.teams[i].name)}</td>${L.map((_, y) => `<td style="background:${col(x.space[y])}">${money(x.space[y])}</td>`).join('')}</tr>`).join('');
   const line = (lbl, arr, neg) => `<tr><td class="l">${lbl}</td>${arr.map((v) => `<td>${v ? (neg ? '−' : '') + money(v) : '<span class="dim">–</span>'}</td>`).join('')}</tr>`;
   const maxAav = Math.max(1, ...T.players.map((p) => p.aav));
-  $('#panel').innerHTML = `<div class="note">Cap space by season (cap − active salary − 50% of cut players' salary). IR players count against future seasons but not the current one; minors-slot players carry no cap hit; players with no contract on file count as $1M free-agent contracts. "Real" adds back salary you could cut for free (default $1M contracts). Click a team to see its contracts.</div>
-   <div><div class="tbl" style="max-height:none"><table><thead><tr><th class="l">Cap space</th>${L.map((l) => `<th>${l}</th>`).join('')}<th title="this season, adding back free cuts">Real ${L[0].slice(2)}</th></tr></thead><tbody>
-     <tr class="sep"><td class="l">Salary cap</td>${cap.caps.map((v) => `<td>${money(v)}</td>`).join('')}<td></td></tr>${matrix}</tbody></table></div>
+  $('#panel').innerHTML = `<div class="note">Cap space by season (cap − active salary − 50% of cut players' salary). IR players count against future seasons but not the current one (so keep room for anyone coming back - see the IR line); minors-slot players carry no cap hit; players with no contract on file count as $1M free-agent contracts, which are free to cut. Click a team to see its contracts.</div>
+   <div><div class="tbl" style="max-height:none"><table><thead><tr><th class="l">Cap space</th>${L.map((l) => `<th>${l}</th>`).join('')}</tr></thead><tbody>
+     <tr class="sep"><td class="l">Salary cap</td>${cap.caps.map((v) => `<td>${money(v)}</td>`).join('')}</tr>${matrix}</tbody></table></div>
    <h3>${esc(DATA.teams[t].name)}</h3><div><div class="tbl" style="max-height:none"><table><thead><tr><th class="l">Season</th>${L.map((l) => `<th>${l}</th>`).join('')}</tr></thead><tbody>
-     ${line('Active salary', T.active)}${line('Injured reserve', T.ir)}${line('Dead / cut', T.dead, true)}${line('Cap space', T.space)}${line('Real space', T.real)}
+     ${line('Active salary', T.active)}${line('Injured reserve', T.ir)}${line('Dead / cut', T.dead, true)}${line('Cap space', T.space)}
+     <tr><td class="l dim" title="current season only: IR salary is excluded from the cap while injured, but counts again when the player returns">Space if IR players return</td>${T.space.map((v, i) => `<td class="dim">${money(i === 0 ? v - T.ir[0] : v)}</td>`).join('')}</tr>
      </tbody></table></div>
      <h3>Contracts</h3><div class="tbl"><table><thead><tr><th class="l">Player</th><th>AAV</th><th>Yrs</th><th class="l"></th>${L.map((l) => `<th>${l.slice(2)}</th>`).join('')}</tr></thead><tbody>
-     ${T.players.map((p) => `<tr><td class="l name">${esc(p.n)}</td><td>${money(p.aav)}</td><td>${p.yrs}</td><td class="l">${p.st === 'Inj Res' ? '<span class="pill ir">IR</span>' : p.free ? '<span class="pill">free cut</span>' : ''}</td>${p.per.map((v) => `<td>${v ? `<span class="bar" style="width:${Math.max(3, v / maxAav * 40)}px"></span>` : ''}</td>`).join('')}</tr>`).join('')}
+     ${T.players.map((p) => `<tr><td class="l name">${esc(p.n)}</td><td>${money(p.aav)}</td><td>${p.yrs}</td><td class="l">${p.st === 'Inj Res' ? '<span class="pill ir">IR</span>' : p.free ? '<span class="pill" title="default $1M contract: cutting it costs nothing">free cut</span>' : ''}</td>${p.per.map((v) => `<td>${v ? `<span class="bar" style="width:${Math.max(3, v / maxAav * 40)}px"></span>` : ''}</td>`).join('')}</tr>`).join('')}
      ${T.cuts.map((p) => `<tr><td class="l name dim">${esc(p.n)} (cut)</td><td class="dim">${money(p.aav)}</td><td>${p.yrs}</td><td class="l"><span class="pill">dead 50%</span></td>${p.per.map((v) => `<td class="dim">${v ? money(v) : ''}</td>`).join('')}</tr>`).join('')}
      </tbody></table></div></div></div>`;
   document.querySelectorAll('.need[data-t]').forEach((tr) => (tr.onclick = () => { S.team = +tr.dataset.t; store.set('team', S.team); drawControls(); tabCap(); }));
@@ -307,28 +317,229 @@ function tabCap() {
 function tabProspects() {
   const t = S.team, n = DATA.teams.length;
   const avg = (list, f) => { const v = list.map(f).filter((x) => x != null && Number.isFinite(x)); return v.length ? v.reduce((p, q) => p + q, 0) / v.length : NaN; };
-  const grads = (list) => list.filter((p) => p.gp > 20).length + list.filter((p) => p.lvl === 'NHL' && p.cert === 10).length;
-  const grp = (list) => ({ up: avg(list, (p) => p.up), ce: avg(list, (p) => p.cert), n: list.filter((p) => p.cert > 0).length, grad: grads(list), all: list.length });
+  const grp = (list) => ({ up: avg(list, (p) => p.up), ce: avg(list, (p) => p.cert), n: list.filter((p) => p.cert > 0).length, all: list.length });
   const rows = DATA.teams.map((tm, i) => {
     const l = DATA.prospects.filter((p) => p.t === i), g = { F: grp(l.filter((p) => p.g === 'F')), D: grp(l.filter((p) => p.g === 'D')), G: grp(l.filter((p) => p.g === 'G')) };
     const w = g.F.n + g.D.n + g.G.n, wavg = (k) => (w ? ['F', 'D', 'G'].reduce((a, x) => a + (Number.isFinite(g[x][k]) ? g[x][k] * g[x].n : 0), 0) / w : NaN);
     return { i, g, up: wavg('up'), ce: wavg('ce'), star: l.filter((p) => p.up >= 9 && p.cert >= 9).length, maybe: l.filter((p) => p.up >= 9 && p.cert < 9).length, lock: l.filter((p) => p.up < 9 && p.cert >= 9).length,
-             a1: l.filter((p) => p.age >= 18 && p.age <= 19).length, a2: l.filter((p) => p.age >= 20 && p.age <= 22).length, a3: l.filter((p) => p.age >= 23).length, grad: g.F.grad + g.D.grad + g.G.grad };
+             a1: l.filter((p) => p.age >= 18 && p.age <= 19).length, a2: l.filter((p) => p.age >= 20 && p.age <= 22).length, a3: l.filter((p) => p.age >= 23).length };
   });
   const fm = (v) => (Number.isFinite(v) ? v.toFixed(2) : '');
   const hc = (v, mid) => `style="${heat((v - mid) * 1.1)}"`;
   const summary = rows.map((r) => `<tr class="${r.i === t ? 'need pick' : 'need'}" data-t="${r.i}"><td class="l name">${esc(DATA.teams[r.i].name)}</td>
      <td ${hc(r.up, 7)}>${fm(r.up)}</td><td>${fm(r.g.F.up)}</td><td>${fm(r.g.D.up)}</td><td>${fm(r.g.G.up)}</td>
      <td ${hc(r.ce, 6.5)}>${fm(r.ce)}</td><td>${fm(r.g.F.ce)}</td><td>${fm(r.g.D.ce)}</td><td>${fm(r.g.G.ce)}</td>
-     <td>${r.g.F.n}</td><td>${r.g.D.n}</td><td>${r.g.G.n}</td><td>${r.star}</td><td>${r.maybe}</td><td>${r.lock}</td><td>${r.a1}</td><td>${r.a2}</td><td>${r.a3}</td><td>${r.grad}</td><td>${money(r.grad * 1e6)}</td></tr>`).join('');
+     <td>${r.g.F.n}</td><td>${r.g.D.n}</td><td>${r.g.G.n}</td><td>${r.star}</td><td>${r.maybe}</td><td>${r.lock}</td><td>${r.a1}</td><td>${r.a2}</td><td>${r.a3}</td></tr>`).join('');
   const mine = DATA.prospects.filter((p) => p.t === t).sort((a, b) => (b.up * 10 + b.cert) - (a.up * 10 + a.cert));
   const eta = DATA.etaYears || {};
-  $('#panel').innerHTML = `<div class="note">Depth summary as in your workbook. Stars = upside ≥ 9 and certainty ≥ 9; maybe = upside ≥ 9, certainty &lt; 9; locks = upside &lt; 9, certainty ≥ 9. Graduate potential = prospects with &gt; 20 NHL GP plus NHL-level prospects with certainty 10; lost cap = graduates × $1M. Click a team to list its prospects.</div>
-   <div class="tbl"><table><thead><tr><th class="l">Team</th><th>Upside</th><th>F</th><th>D</th><th>G</th><th>Certainty</th><th>F</th><th>D</th><th>G</th><th title="prospects with certainty &gt; 0">#F</th><th>#D</th><th>#G</th><th>Stars</th><th>Maybe</th><th>Locks</th><th>18-19</th><th>20-22</th><th>23+</th><th>Grads</th><th>Lost cap</th></tr></thead><tbody>${summary}</tbody></table></div>
+  $('#panel').innerHTML = `<div class="note">Depth summary as in your workbook. Stars = upside ≥ 9 and certainty ≥ 9; maybe = upside ≥ 9, certainty &lt; 9; locks = upside &lt; 9, certainty ≥ 9. Click a team to list its prospects.</div>
+   <div class="tbl"><table><thead><tr><th class="l">Team</th><th>Upside</th><th>F</th><th>D</th><th>G</th><th>Certainty</th><th>F</th><th>D</th><th>G</th><th title="prospects with certainty &gt; 0">#F</th><th>#D</th><th>#G</th><th>Stars</th><th>Maybe</th><th>Locks</th><th>18-19</th><th>20-22</th><th>23+</th></tr></thead><tbody>${summary}</tbody></table></div>
    <h3>${esc(DATA.teams[t].name)} prospects</h3>
    <div class="tbl"><table><thead><tr><th class="l">Player</th><th class="l">Pos</th><th>Age</th><th class="l">Level</th><th>ETA yrs</th><th>Upside</th><th>Certainty</th><th>NHL GP</th><th class="l">Trajectory</th><th class="l">Next season</th></tr></thead><tbody>
    ${mine.map((p) => `<tr><td class="l name">${esc(p.n)}</td><td class="l">${esc(p.g)}</td><td>${p.age ?? ''}</td><td class="l">${esc(p.lvl || '')}</td><td>${eta[p.lvl] ?? ''}</td><td style="${heat((p.up - 7) * 1.2)}">${p.up ?? ''}</td><td style="${heat((p.cert - 5) * .6)}">${p.cert ?? ''}</td><td>${p.gp || ''}</td><td class="l">${esc(p.traj || '')}</td><td class="l">${esc(p.nxt || '')}</td></tr>`).join('')}</tbody></table></div>`;
   document.querySelectorAll('.need[data-t]').forEach((tr) => (tr.onclick = () => { S.team = +tr.dataset.t; store.set('team', S.team); drawControls(); tabProspects(); }));
+}
+
+/* ------------------------------------------------------------------ Evaluator */
+/* Adds / removals for one team -> category SAR, lineup, cap. Lineup = 12 F, 6 D, 2 G in Active slots (as every team has now).
+   Category impact is measured in SAR (value over a free-agent replacement), so 2-for-1 and 1-for-2 moves compare fairly:
+   an empty lineup slot counts as 0 (replacement level). Players below the games floor, or with no stats, count as 0. */
+const SLOTS = { F: 12, D: 6, G: 2 };
+const evOf = (t) => { const k = String(t); if (!S.ev[k]) S.ev[k] = { adds: [], rems: [] }; return S.ev[k]; };
+const evSave = () => store.set('ev', S.ev);
+const evCount = () => { const e = S.ev[String(S.team)]; return e ? e.adds.length + e.rems.length : 0; };
+const SKC_ALL = () => ALL_SK.filter((c) => c !== 'GP' || S.gpCat);
+
+function evAddFromRow(r, t) {                      // default contract terms for a player coming in
+  const ro = rosterByHr.get(r.id) || null;
+  const owner = ro ? ro.t : -1;
+  return { id: r.id, aav: ro && ro.aav != null ? ro.aav : DATA.defaultAav, yrs: ro && ro.yrs ? ro.yrs : 1, slot: 'roster', owner };
+}
+function evAdd(id) {
+  const t = S.team, e = evOf(t), r = C.rowMap.get(id);
+  if (!r || r.owner === t || e.adds.some((a) => a.id === id)) return false;
+  e.adds.push(evAddFromRow(r, t)); evSave(); return true;
+}
+function evTradeIn(e) { return e.adds.some((a) => a.owner >= 0); }
+function evHow(e, m) { return m.how || (evTradeIn(e) ? 'trade' : 'cut'); }
+
+function mkMember(r, st) { return { key: r.fid, name: r.n, grp: r.g, st, row: r.hr ? C.rowMap.get(r.hr) || null : null, ro: r }; }
+const mscore = (m) => (m.row && Number.isFinite(m.row.tSAR) ? m.row.tSAR : -1e9);
+const NOMOVE = { adds: [], rems: [] };
+function lineupOf(t, e = NOMOVE) {                  // slots are filled the same way before and after, so the comparison is like for like
+  const rem = new Set(e.rems.map((m) => m.fid));
+  const mine = DATA.roster.filter((r) => r.t === t && !rem.has(r.fid)).map((r) => mkMember(r, r.st));
+  const addM = e.adds.filter((a) => a.slot === 'roster').map((a) => { const row = C.rowMap.get(a.id); return { key: 'add:' + a.id, name: row.name, grp: row.grp, st: 'Added', row, added: a }; });
+  const out = { F: [], D: [], G: [] }, bumped = [], promoted = [];
+  for (const g of ['F', 'D', 'G']) {
+    let act = mine.filter((m) => m.grp === g && m.st === 'Active').concat(addM.filter((m) => m.grp === g));
+    const res = mine.filter((m) => m.grp === g && m.st === 'Reserve').sort((a, b) => mscore(b) - mscore(a));
+    if (act.length > SLOTS[g]) { act.sort((a, b) => mscore(b) - mscore(a)); bumped.push(...act.slice(SLOTS[g])); act = act.slice(0, SLOTS[g]); }
+    else if (act.length < SLOTS[g]) while (act.length < SLOTS[g] && res.length) { const m = res.shift(); act.push(m); promoted.push(m); }
+    out[g] = act;
+  }
+  out.bumped = bumped; out.promoted = promoted; return out;
+}
+function sumsOf(L) {                               // category SAR sums (skaters / goalies) and total tSAR
+  const s = { sk: {}, gk: {}, tot: 0, skTot: 0, gkTot: 0 };
+  for (const g of ['F', 'D', 'G']) for (const m of L[g]) {
+    const r = m.row; if (!r || !Number.isFinite(r.tSAR)) continue;
+    if (g === 'G') { for (const c of G_CATS) if (r.sar[c] != null) s.gk[c] = (s.gk[c] || 0) + r.sar[c]; s.gkTot += r.tSAR; }
+    else { for (const c of ALL_SK) if (r.sar[c] != null && (c !== 'GP' || S.gpCat)) s.sk[c] = (s.sk[c] || 0) + r.sar[c]; s.skTot += r.tSAR; }
+    s.tot += r.tSAR;
+  }
+  return s;
+}
+function leagueSums() { return DATA.teams.map((_, i) => sumsOf(lineupOf(i))); }
+const rankOf = (vals, t, v) => 1 + vals.reduce((n, x, i) => n + (i !== t && x > v + 1e-12 ? 1 : 0), 0);
+
+function perYear(aav, yrs, n) { return Array.from({ length: n }, (_, i) => (i < yrs ? aav : 0)); }
+function capScenario(t, e) {                       // mirrors build_cap in the generator
+  const cap = DATA.cap, T = cap.teams[t], n = cap.caps.length, share = DATA.deadShare;
+  const active = T.active.slice(), ir = T.ir.slice(), dead = T.dead.slice(), lines = [];
+  for (const m of e.rems) {
+    const r = DATA.roster.find((x) => x.fid === m.fid); if (!r) continue;
+    const aav = r.aav != null ? r.aav : DATA.defaultAav, yrs = r.yrs || 1, per = perYear(aav, yrs, n), how = evHow(e, m);
+    if (r.st !== 'Minors') for (let i = 0; i < n; i++) { if (r.st === 'Inj Res') { ir[i] -= per[i]; if (i > 0) active[i] -= per[i]; } else active[i] -= per[i]; }
+    let d = 0;
+    if (how === 'cut' && !r.free) { for (let i = 0; i < n; i++) if (i < yrs) { dead[i] += share * aav; d += share * aav; } }
+    lines.push({ name: r.n, kind: 'out', how, aav, yrs, free: r.free, dead: d, mini: r.st === 'Minors' });
+  }
+  for (const a of e.adds) {
+    const row = C.rowMap.get(a.id); if (!row) continue;
+    if (a.slot === 'roster') { const per = perYear(a.aav, a.yrs, n); for (let i = 0; i < n; i++) active[i] += per[i]; }
+    lines.push({ name: row.name, kind: 'in', aav: a.aav, yrs: a.yrs, owner: a.owner, mini: a.slot !== 'roster' });
+  }
+  const space = cap.caps.map((c, i) => c - active[i] - dead[i]);
+  return { before: T.space, after: space, active, dead, ir, lines, irBack: [T.space[0] - T.ir[0], space[0] - ir[0]] };
+}
+
+function moveRow(r, dir, extra, cats) {
+  const unr = !r || !Number.isFinite(r.tSAR);
+  return `<td class="l"><span class="pill ${dir === 'in' ? 'fa' : 'ir'}">${dir === 'in' ? 'IN' : 'OUT'}</span></td><td class="l name">${esc(r ? r.name : extra.name)}${unr ? ' <span class="warn" title="below the games floor or no stats - counted as 0">*</span>' : ''}</td>
+    <td class="l">${esc(r ? (r.p.pos || r.grp) : extra.pos || '')}</td><td>${r ? r.GP : ''}</td><td><b>${r ? f2(r.tSAR) : ''}</b></td>${r ? catCells(r, cats) : cats.map(() => '<td></td>').join('')}`;
+}
+
+function tabEval() {
+  const t = S.team, e = evOf(t), tm = DATA.teams[t], byId = C.rowMap;
+  e.adds = e.adds.filter((a) => byId.has(a.id)); e.rems = e.rems.filter((m) => DATA.roster.some((r) => r.fid === m.fid && r.t === t));
+  const empty = !e.adds.length && !e.rems.length;
+  const L1 = lineupOf(t, e);
+  const lg = leagueSums(), S0 = lg[t], S1 = empty ? S0 : sumsOf(L1);
+  const cap = capScenario(t, e), labels = DATA.cap.labels, n = DATA.teams.length;
+  const addRows = e.adds.map((a, i) => {
+    const r = byId.get(a.id), ro = rosterByHr.get(a.id), fa = a.owner < 0;
+    return `<tr><td class="l name">${esc(r.name)} <span class="dim">${esc(r.tm)} ${esc(r.p.pos || r.grp)}</span></td><td class="l">${fa ? '<span class="pill fa">FA</span>' : 'trade from ' + esc(teamName(a.owner))}</td>
+      <td><input type="number" step="0.1" min="0" value="${(a.aav / 1e6).toFixed(2).replace(/\.?0+$/, '')}" data-i="${i}" data-f="aav" title="AAV in $M"></td>
+      <td><input type="number" step="1" min="1" max="6" value="${a.yrs}" data-i="${i}" data-f="yrs" title="contract years from this season"></td>
+      <td><select data-i="${i}" data-f="slot"><option value="roster" ${a.slot === 'roster' ? 'selected' : ''}>Roster</option><option value="minors" ${a.slot === 'minors' ? 'selected' : ''}>Minors (no cap, no lineup)</option></select></td>
+      <td><button class="mini" data-del="add" data-i="${i}">remove</button></td></tr>`;
+  }).join('');
+  const how = (m) => evHow(e, m);
+  const remRows = e.rems.map((m, i) => {
+    const ro = DATA.roster.find((x) => x.fid === m.fid), r = ro.hr ? byId.get(ro.hr) : null, h = how(m);
+    const note = h === 'cut' ? (ro.free ? 'free cut' : 'dead cap ' + money(DATA.deadShare * (ro.aav ?? 0)) + ' x ' + (ro.yrs || 1) + ' yr') : 'salary leaves';
+    return `<tr><td class="l name">${esc(ro.n)} <span class="dim">${esc(ro.tm || '')} ${ro.g}</span></td><td class="l">${esc(ro.st)}</td><td>${ro.aav != null ? money(ro.aav) : '<span class="dim">$1M</span>'}</td><td>${ro.yrs ?? ''}</td>
+      <td><select data-i="${i}" data-f="how"><option value="" ${!m.how ? 'selected' : ''}>Auto (${evTradeIn(e) ? 'trade' : 'cut'})</option><option value="cut" ${m.how === 'cut' ? 'selected' : ''}>Cut / drop</option><option value="trade" ${m.how === 'trade' ? 'selected' : ''}>Trade away</option></select></td>
+      <td class="dim">${esc(note)}</td><td><button class="mini" data-del="rem" data-i="${i}">remove</button></td></tr>`;
+  }).join('');
+
+  /* ---- headline numbers */
+  const dTot = S1.tot - S0.tot, r0 = rankOf(lg.map((x) => x.tot), t, S0.tot), r1 = rankOf(lg.map((x) => x.tot), t, S1.tot);
+  const sp0 = cap.before[0], sp1 = cap.after[0], dSp = sp1 - sp0;
+  const costPer = dTot > 0.05 && dSp < 0 ? money(-dSp / dTot) + ' per +1 tSAR' : '';
+  const card = (k, v, sub) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div><div class="dim">${sub || ''}</div></div>`;
+  const sgn = (v, d = 2) => (v > 0 ? '+' : v < 0 ? '−' : '') + Math.abs(v).toFixed(d);
+  const msgn = (v) => (Math.abs(v) < 1 ? '–' : (v > 0 ? '+' : '−') + money(Math.abs(v)));
+
+  /* ---- category tables */
+  const catTable = (cats, a, b, title, rankKey) => {
+    const rows = cats.map((c) => {
+      const v0 = a[c] || 0, v1 = b[c] || 0, d = v1 - v0;
+      const vals = lg.map((x, i) => (i === t ? v0 : (x[rankKey][c] || 0)));
+      const k0 = rankOf(vals, t, v0), k1 = rankOf(vals, t, v1);
+      return `<tr><td class="l name"><span title="${esc(CAT_HELP[c] || '')}">${CAT_LABEL[c]}</span></td><td>${f2(v0)}</td><td>${f2(v1)}</td><td style="${heat(d * 1.5)}"><b>${Math.abs(d) < 0.005 ? '0.00' : sgn(d)}</b></td>
+        <td>${k0}${k0 !== k1 ? ` → <b>${k1}</b>` : ''} <span class="dim">/ ${n}</span></td></tr>`;
+    }).join('');
+    return `<h3>${title}</h3><div class="tbl" style="max-height:none"><table><thead><tr><th class="l">Category</th><th>Now</th><th>After</th><th>Change</th><th>Rank of ${n}</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  };
+  const anyG = e.adds.some((a) => byId.get(a.id).grp === 'G') || e.rems.some((m) => { const ro = DATA.roster.find((x) => x.fid === m.fid); return ro && ro.g === 'G'; });
+
+  /* ---- move detail tables */
+  const mv = { sk: [], gk: [] };
+  for (const a of e.adds) { const r = byId.get(a.id); (r.grp === 'G' ? mv.gk : mv.sk).push(`<tr>${moveRow(r, 'in', null, r.grp === 'G' ? G_CATS : ALL_SK)}</tr>`); }
+  for (const m of e.rems) { const ro = DATA.roster.find((x) => x.fid === m.fid), r = ro.hr ? byId.get(ro.hr) : null; (ro.g === 'G' ? mv.gk : mv.sk).push(`<tr>${moveRow(r, 'out', { name: ro.n, pos: ro.g }, ro.g === 'G' ? G_CATS : ALL_SK)}</tr>`); }
+  const mvTable = (rows, cats) => rows.length ? `<div class="tbl" style="max-height:none;margin-bottom:8px"><table><thead><tr><th class="l"></th><th class="l">Player</th><th class="l">Pos</th><th title="games played in the window">Games</th><th>tSAR</th>${cats.map((c) => `<th class="heat" title="${esc(CAT_HELP[c] || c)}">${CAT_LABEL[c]}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>` : '';
+
+  /* ---- cap table */
+  const dRow = (lbl, arr, sign) => `<tr><td class="l">${lbl}</td>${arr.map((v) => `<td>${sign ? msgn(v) : money(v)}</td>`).join('')}</tr>`;
+  const warnCap = cap.after.map((v, i) => (v < 0 ? labels[i] : null)).filter(Boolean);
+  const bumped = L1.bumped.map((m) => m.name), promoted = L1.promoted.map((m) => m.name);
+  const unr = [...e.adds.filter((a) => a.slot === 'roster').map((a) => byId.get(a.id)), ...e.rems.map((m) => DATA.roster.find((x) => x.fid === m.fid)).filter((ro) => ro && ro.st !== 'Minors').map((ro) => (ro.hr ? byId.get(ro.hr) || null : null))].filter((r) => !r || !Number.isFinite(r.tSAR)).length;
+  const best = (cats, a, b) => { const d = cats.map((c) => [c, (b[c] || 0) - (a[c] || 0)]).filter(([, v]) => Math.abs(v) >= 0.05).sort((x, y) => y[1] - x[1]); return d; };
+  const dl = best(SKC_ALL(), S0.sk, S1.sk);
+  const summary = empty ? 'Add players you are considering, and any players you would send away or drop. Everything below updates as you go.' :
+    `Net <b>${sgn(dTot)} tSAR</b> (${r0 === r1 ? 'team rank stays ' + r0 : 'team rank ' + r0 + ' → ' + r1} of ${n}). ` +
+    (dl.length ? `Biggest gains: ${dl.filter(([, v]) => v > 0).slice(0, 3).map(([c, v]) => CAT_LABEL[c] + ' ' + sgn(v)).join(', ') || 'none'}. Biggest losses: ${dl.filter(([, v]) => v < 0).slice(-3).reverse().map(([c, v]) => CAT_LABEL[c] + ' ' + sgn(v)).join(', ') || 'none'}. ` : '') +
+    `Cap space ${labels[0]}: ${money(sp0)} → <b>${money(sp1)}</b>.` + (warnCap.length ? ` <span class="warn">Over the cap in ${warnCap.join(', ')}.</span>` : '');
+
+  $('#panel').innerHTML = `<div class="note"><b>${esc(tm.name)}</b> - try a move before you make it. Pick players coming in (free agents or players on other teams, which means a trade) and players going out (dropped or traded). Uses the stat window, games floor and pool chosen above. Change team in the selector at the top.</div>
+   <div class="two eq">
+    <div><h3>Coming in</h3><div class="pick"><input type="search" id="pickAdd" placeholder="search any player, or focus for the best free agents" autocomplete="off"><div class="res" id="resAdd"></div></div>
+      ${e.adds.length ? `<div class="tbl" style="max-height:none"><table><thead><tr><th class="l">Player</th><th class="l">From</th><th>AAV $M</th><th>Years</th><th class="l">Slot</th><th></th></tr></thead><tbody>${addRows}</tbody></table></div>` : '<div class="note dim">Nobody added yet. Free agents come in at the $1M minimum for one year; players on other teams come with their current contract.</div>'}</div>
+    <div><h3>Going out</h3><div class="pick"><input type="search" id="pickRem" placeholder="search your roster, or focus to see your weakest players" autocomplete="off"><div class="res" id="resRem"></div></div>
+      ${e.rems.length ? `<div class="tbl" style="max-height:none"><table><thead><tr><th class="l">Player</th><th class="l">Slot</th><th>AAV</th><th>Yrs</th><th class="l">How</th><th class="l">Cap effect</th><th></th></tr></thead><tbody>${remRows}</tbody></table></div>` : '<div class="note dim">Nobody removed yet. A dropped non-free contract costs 50% of its salary against your cap for its remaining years; a traded player\'s salary leaves with him.</div>'}</div>
+   </div>
+   <div class="note" style="font-size:14px">${summary}</div>
+   <div class="cards">
+     ${card('Team tSAR change', sgn(dTot), `${f2(S0.tot)} → ${f2(S1.tot)} (lineup total)`)}
+     ${card('Team rank', r0 === r1 ? `${r0}` : `${r0} → ${r1}`, `of ${n} by lineup tSAR`)}
+     ${card('Cap space ' + labels[0], money(sp1), `${msgn(dSp)} vs. now (${money(sp0)})`)}
+     ${card('Space if IR players return', money(cap.irBack[1]), `${msgn(cap.irBack[1] - cap.irBack[0])} vs. now (${money(cap.irBack[0])})`)}
+     ${costPer ? card('Price of the upgrade', costPer, labels[0] + ' cap space') : ''}
+   </div>
+   ${empty ? '' : `
+   <h3>The players</h3>${legend()}${mvTable(mv.sk, ALL_SK)}${mvTable(mv.gk, G_CATS)}
+   ${bumped.length ? `<div class="note">Moves to the Reserve slot to make room: <b>${esc(bumped.join(', '))}</b>.</div>` : ''}${promoted.length ? `<div class="note">Promoted from Reserve to fill an open lineup spot: <b>${esc(promoted.join(', '))}</b>.</div>` : ''}
+   ${unr ? `<div class="note warn">* Below the ${S.floor}-game minimum or no stats yet, so counted as 0 (replacement level). Lower the minimum at the top to include them.</div>` : ''}
+   <div class="two eq"><div>${catTable(SKC_ALL(), S0.sk, S1.sk, 'Skater categories - lineup SAR (12 F + 6 D)', 'sk')}${anyG ? catTable(G_CATS, S0.gk, S1.gk, 'Goalie categories - lineup SAR (2 G)', 'gk') : ''}</div>
+    <div><h3>Cap space by season</h3><div class="tbl" style="max-height:none"><table><thead><tr><th class="l"></th>${labels.map((l) => `<th>${l}</th>`).join('')}</tr></thead><tbody>
+        ${dRow('Now', cap.before)}${dRow('After', cap.after)}${dRow('Change', cap.after.map((v, i) => v - cap.before[i]), true)}
+        ${cap.dead.some((v, i) => v !== DATA.cap.teams[t].dead[i]) ? dRow('Dead cap after', cap.dead) : ''}</tbody></table></div>
+      ${cap.lines.length ? '<div class="note">' + cap.lines.map((x) => x.kind === 'in' ? `In: ${esc(x.name)} ${money(x.aav)} x ${x.yrs} yr${x.mini ? ' (minors, no cap hit)' : ''}` : `Out: ${esc(x.name)} - ${x.how === 'cut' ? (x.free ? 'free cut' : 'dropped, dead cap ' + money(x.dead) + ' in total') : 'traded, salary leaves'}`).join('<br>') + '</div>' : ''}
+    </div></div>`}`;
+
+  /* ---- events */
+  const refreshEv = () => { evSave(); drawTabs(); tabEval(); };
+  const picker = (inputId, resId, source, onPick) => {
+    const inp = $(inputId), res = $(resId);
+    const show = () => { const q = inp.value.trim().toLowerCase(); const items = source(q); res.innerHTML = items.length ? items.map((x, i) => `<div class="opt" data-i="${i}">${x.html}</div>`).join('') : '<div class="opt dim">no match</div>'; res.style.display = 'block'; res._items = items; };
+    inp.oninput = show; inp.onfocus = show;
+    res.onmousedown = (ev) => { const o = ev.target.closest('.opt'); if (!o || o.dataset.i == null) return; ev.preventDefault(); onPick(res._items[+o.dataset.i]); };
+    inp.onblur = () => setTimeout(() => (res.style.display = 'none'), 120);
+  };
+  picker('#pickAdd', '#resAdd', (q) => {
+    let rows = C.rows.filter((r) => r.owner !== t && !e.adds.some((a) => a.id === r.id));
+    rows = q ? rows.filter((r) => r.name.toLowerCase().includes(q)) : rows.filter((r) => r.owner < 0);
+    rows = rows.filter((r) => Number.isFinite(r.tSAR) || q).sort((a, b) => (Number.isFinite(b.tSAR) ? b.tSAR : -1e9) - (Number.isFinite(a.tSAR) ? a.tSAR : -1e9)).slice(0, 8);
+    return rows.map((r) => ({ id: r.id, html: `<b>${esc(r.name)}</b> <span class="dim">${esc(r.p.pos || r.grp)} ${esc(r.tm)} · ${r.owner < 0 ? 'FA' : esc(teamName(r.owner))} · tSAR ${f2(r.tSAR) || 'n/a'}</span>` }));
+  }, (x) => { evAdd(x.id); refreshEv(); });
+  picker('#pickRem', '#resRem', (q) => {
+    let ros = DATA.roster.filter((r) => r.t === t && !e.rems.some((m) => m.fid === r.fid));
+    const sc = (r) => { const s = r.hr ? byId.get(r.hr) : null; return s && Number.isFinite(s.tSAR) ? s.tSAR : -1e9; };
+    ros = q ? ros.filter((r) => r.n.toLowerCase().includes(q)) : ros.filter((r) => r.st !== 'Minors');
+    ros = ros.sort((a, b) => (q ? sc(b) - sc(a) : sc(a) - sc(b))).slice(0, 10);
+    return ros.map((r) => { const s = r.hr ? byId.get(r.hr) : null; return { fid: r.fid, html: `<b>${esc(r.n)}</b> <span class="dim">${r.g} ${esc(r.tm || '')} · ${esc(r.st)} · ${r.aav != null ? money(r.aav) : '$1M'} · tSAR ${s ? f2(s.tSAR) || 'n/a' : 'n/a'}</span>` }; });
+  }, (x) => { evOf(t).rems.push({ fid: x.fid, how: null }); refreshEv(); });
+  document.querySelectorAll('#panel [data-f]').forEach((el) => (el.onchange = () => {
+    const i = +el.dataset.i, f = el.dataset.f;
+    if (f === 'how') e.rems[i].how = el.value || null;
+    else if (f === 'aav') e.adds[i].aav = Math.max(0, +el.value || 0) * 1e6;
+    else if (f === 'yrs') e.adds[i].yrs = Math.min(6, Math.max(1, Math.round(+el.value) || 1));
+    else e.adds[i][f] = el.value;
+    refreshEv();
+  }));
+  document.querySelectorAll('#panel [data-del]').forEach((b) => (b.onclick = () => { (b.dataset.del === 'add' ? e.adds : e.rems).splice(+b.dataset.i, 1); refreshEv(); }));
 }
 
 /* ------------------------------------------------------------------ Changes */
@@ -351,6 +562,8 @@ function tabMethod() {
    <b>Blend</b> pools both seasons' totals, so a player's per-game rate is weighted by games played; choosing a single season reproduces the workbook exactly. <b>Min games to rank</b> hides tSAR for small samples but never changes the medians, SDs or replacement levels.<br>
    <b>Cor fix:</b> the workbook's Corsi lookup stopped at row 1011 of a 1063-row table, so ~50 players near the end of the alphabet showed Cor = 0. Here every stat is joined on the Hockey-Reference player ID, so that can't happen.<br>
    <b>Market $</b> = tSAR ÷ the median SAR-per-$M of owned players at that position × $1M (floor $1M); <b>Value</b> = (market − AAV) ÷ market.</div>
+   <h3>Evaluator</h3>
+   <div class="note">A move is measured in SAR (value over a free-agent replacement), so a 2-for-1 compares fairly: an empty lineup slot counts as replacement level (0). The lineup is the 12 forward, 6 defense and 2 goalie Active slots. If an added player pushes the lineup past a slot count, the lowest-tSAR player in that group moves to Reserve; if a removal leaves a hole, the best Reserve player of that position steps in. Players below the games floor or with no stats count as 0. Cap: dropping a player on a non-free contract adds 50% of his salary as dead cap for each remaining contract year; trading him away removes his salary; free agents arrive at $1M for one year; a player acquired by trade keeps his contract. Rank compares your lineup total to the other 13 teams' current Active lineups.</div>
    <h3>Choices you can flip</h3>
    <div class="note"><b>Pool = Real contracts</b> uses owned players on a negotiated contract for the median/SD, as the workbook did, but without the $0.1M prospect placeholders (Fantrax ownership now keeps prospects off the free-agent list, so the placeholder isn't needed). Players picked up as $1M free agents are excluded, as in the workbook. <b>All owned players</b> uses everyone currently on a team, prospects included. Free agents (replacement pool) are always players not on any Fantrax roster.</div>
    <h3>Data</h3>

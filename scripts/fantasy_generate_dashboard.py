@@ -75,7 +75,8 @@ def cap_series(base, n=6):
 
 
 def build_cap(teams, roster, cuts, settings, first_label="2026-27", n=6):
-    """roster: dicts with t (team idx), st, aav, yrs, free(bool), fid, n. cuts: dicts with t, aav, n."""
+    """roster: dicts with t (team idx), st, aav, yrs, free(bool = $1M default contract, a free cut), n. cuts: dicts with t, aav, n, yrs.
+    space = cap - active salary - dead cap (50% of cut players' salary). IR is excluded from the current season only."""
     base = settings.get("salary_cap", {}).get("base", [104000000, 113500000])
     caps = cap_series(base, n)
     default_aav = settings.get("default_fa_aav", 1000000)
@@ -85,7 +86,7 @@ def build_cap(teams, roster, cuts, settings, first_label="2026-27", n=6):
     labels = [f"{y0 + i}-{str(y0 + i + 1)[2:]}" for i in range(n)]
     out = []
     for ti, team in enumerate(teams):
-        active, ir, dead, free = [0.0] * n, [0.0] * n, [0.0] * n, [0.0] * n
+        active, ir, dead = [0.0] * n, [0.0] * n, [0.0] * n
         players = []
         for r in roster:
             if r["t"] != ti or r["st"] == "Minors":
@@ -101,9 +102,7 @@ def build_cap(teams, roster, cuts, settings, first_label="2026-27", n=6):
                         active[i] += per[i]       # IR is excluded from this season's cap only (as in the workbook)
                 else:
                     active[i] += per[i]
-                if r["free"] and i == 0 and not is_ir:
-                    free[i] += per[i]
-            players.append(dict(n=r["n"], g=r["g"], st=r["st"], aav=aav, yrs=yrs, free=r["free"], per=per))
+            players.append(dict(n=r["n"], g=r["g"], st=r["st"], aav=aav, yrs=yrs, free=r["free"], ct=r.get("ct"), per=per))
         cuts_t = []
         for c in cuts:
             if c["t"] != ti:
@@ -113,9 +112,8 @@ def build_cap(teams, roster, cuts, settings, first_label="2026-27", n=6):
             for i in range(n):
                 dead[i] += per[i]
             cuts_t.append(dict(n=c["n"], aav=c["aav"], yrs=yrs, per=per))
-        space = [caps[i] - active[i] - dead[i] for i in range(n)]
-        real = [space[i] + free[i] for i in range(n)]
-        out.append(dict(t=ti, active=active, ir=ir, dead=dead, space=space, real=real, free=free,
+        space = [caps[i] - active[i] - dead[i] for i in range(n)]       # dead cap is always included
+        out.append(dict(t=ti, active=active, ir=ir, dead=dead, space=space,
                         players=sorted(players, key=lambda p: -p["aav"]), cuts=cuts_t))
     return dict(labels=labels, caps=caps, teams=out)
 
@@ -209,7 +207,9 @@ def render(data, out_path):
                    defaultAav=data["settings"].get("default_fa_aav", 1000000),
                    teams=data["teams"], roster=data["roster"], players=data["players"], cap=cap,
                    prospects=data["prospects"], changes=data["changes"],
-                   etaYears=data["settings"].get("league_eta_years", {}), myTeam=MY_TEAM_NAME)
+                   etaYears=data["settings"].get("league_eta_years", {}), myTeam=MY_TEAM_NAME,
+                   deadShare=data["settings"].get("dead_cap_share", 0.5),
+                   tiers=data["settings"].get("contract_tiers", [[1000000, 1]]))
     with open(os.path.join(HERE, "fantasy_sar_engine.js"), encoding="utf-8") as f:
         engine = f.read()
     with open(os.path.join(HERE, "fantasy_dashboard_template.html"), encoding="utf-8") as f:
