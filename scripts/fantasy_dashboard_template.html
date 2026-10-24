@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dynasty Puck</title>
+<style>
+:root{--bg:#fcfcfb;--panel:#fff;--ink:#1d1d1b;--ink2:#55554f;--muted:#8a8a82;--line:#e4e3de;--head:#f4f3ef;
+--pos:42,111,219;--neg:217,72,43;--accent:#2a6fdb;--warn:#b7791f;--sel:#eaf1fd}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#1a1a19;--panel:#222220;--ink:#efeee9;--ink2:#b5b4ab;--muted:#86857c;--line:#363633;--head:#2a2a28;
+--pos:88,150,240;--neg:236,125,92;--accent:#6aa0f2;--warn:#e0a640;--sel:#25344d}}
+:root[data-theme=dark]{--bg:#1a1a19;--panel:#222220;--ink:#efeee9;--ink2:#b5b4ab;--muted:#86857c;--line:#363633;--head:#2a2a28;
+--pos:88,150,240;--neg:236,125,92;--accent:#6aa0f2;--warn:#e0a640;--sel:#25344d}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{padding:16px 16px 0;max-width:1500px;margin:0 auto}
+h1{font-size:20px;margin:0 0 2px}
+.sub{color:var(--muted);font-size:12px}
+.wrap{max-width:1500px;margin:0 auto;padding:0 16px 40px}
+.controls{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:end;padding:12px 0;border-bottom:1px solid var(--line)}
+.ctl{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--ink2)}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.seg button{border:0;background:var(--panel);color:var(--ink2);padding:5px 10px;cursor:pointer;font:inherit}
+.seg button+button{border-left:1px solid var(--line)}
+.seg button.on{background:var(--accent);color:#fff}
+select,input[type=number],input[type=search]{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:5px 8px;font:inherit}
+input[type=number]{width:64px}
+nav{display:flex;gap:2px;flex-wrap:wrap;border-bottom:1px solid var(--line);margin-top:10px}
+nav button{border:0;background:none;color:var(--ink2);padding:9px 14px;cursor:pointer;font:inherit;border-bottom:2px solid transparent}
+nav button.on{color:var(--ink);border-bottom-color:var(--accent);font-weight:600}
+.panel{margin-top:14px}
+.tbl{overflow:auto;max-height:76vh;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+table{border-collapse:separate;border-spacing:0;width:100%;font-variant-numeric:tabular-nums}
+th,td{padding:4px 8px;white-space:nowrap;text-align:right;border-bottom:1px solid var(--line)}
+th{position:sticky;top:0;background:var(--head);z-index:2;font-weight:600;font-size:12px;color:var(--ink2);cursor:pointer;user-select:none}
+th.l,td.l{text-align:left}
+th.on{color:var(--ink)}
+td.name{font-weight:550}
+tr:hover td{background:var(--sel)}
+tr.sep td{background:var(--head);font-weight:600;text-align:left;color:var(--ink2)}
+.heat{min-width:46px}
+.dim{color:var(--muted)}
+.pill{display:inline-block;padding:0 6px;border-radius:9px;font-size:11px;border:1px solid var(--line);color:var(--ink2)}
+.pill.fa{border-color:var(--accent);color:var(--accent)}
+.pill.ir{border-color:var(--warn);color:var(--warn)}
+.note{color:var(--ink2);font-size:12px;margin:8px 0}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px;margin:10px 0}
+.card{border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:var(--panel)}
+.card .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.card .v{font-size:20px;font-weight:650}
+.two{display:grid;grid-template-columns:minmax(300px,1fr) minmax(300px,1.4fr);gap:16px;align-items:start}
+@media(max-width:900px){.two{grid-template-columns:1fr}}
+.need{cursor:pointer}
+.need.pick td{outline:2px solid var(--accent);outline-offset:-2px}
+.legend{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--ink2);margin:6px 0}
+.ramp{display:inline-flex;border:1px solid var(--line);border-radius:4px;overflow:hidden}
+.ramp i{display:block;width:22px;height:12px}
+h3{font-size:14px;margin:14px 0 6px}
+.empty{padding:30px;color:var(--muted);text-align:center}
+.warn{color:var(--warn)}
+.bar{display:inline-block;height:8px;border-radius:2px;background:var(--accent);vertical-align:middle;opacity:.75}
+@media(max-width:700px){.sticky1{position:static}}
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Dynasty Puck</h1>
+  <div class="sub" id="asof"></div>
+</header>
+<div class="wrap">
+  <div class="controls" id="controls"></div>
+  <nav id="tabs"></nav>
+  <div class="panel" id="panel"></div>
+</div>
+<script>/*ENGINE*/</script>
+<script>
+const DATA = /*DATA*/null;
+"use strict";
+const $ = (s, r = document) => r.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const store = { get(k, d) { try { const v = localStorage.getItem('dp_' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+                set(k, v) { try { localStorage.setItem('dp_' + k, JSON.stringify(v)); } catch (e) {} } };
+
+/* ------------------------------------------------------------------ state */
+const myIdx = Math.max(0, DATA.teams.findIndex((t) => t.name === DATA.myTeam));
+const S = { win: store.get('win', 'blend'), floor: store.get('floor', 10), pool: store.get('pool', 'sheet'), gpCat: store.get('gpCat', true),
+            tab: store.get('tab', 'players'), team: store.get('team', myIdx), grp: 'ALL', owner: 'ALL', q: '',
+            sort: { k: 'tSAR', dir: -1 }, need: 'STP', limit: 300 };
+const SKC = { F: SK_CATS_F, D: SK_CATS_D };
+const CAT_LABEL = { GP: 'GP', PTD: 'Pt-D', G: 'G', A: 'A', P2GA: '2G+A', PIM: 'PIM', SOG: 'SOG', STP: 'STP', Hit: 'Hit', Blk: 'Blk', TK: 'TK', Cor: 'Cor', W: 'W', GAA: 'GAA', SV: 'SV%', SHO: 'SHO' };
+const CAT_HELP = { G: 'goals', A: 'assists', P2GA: 'goals counted double + assists', PTD: 'defensemen points (G+A)', PIM: 'penalty minutes', SOG: 'shots on goal', STP: 'special-teams points (PPG+PPA+SHG+SHA)', Hit: 'hits', Blk: 'blocked shots', TK: 'takeaways', Cor: 'Corsi differential (CF-CA)', GP: 'games played (total)' };
+const ALL_SK = ['GP', 'PTD', 'G', 'A', 'P2GA', 'PIM', 'SOG', 'STP', 'Hit', 'Blk', 'TK', 'Cor'];
+const rosterByHr = new Map(DATA.roster.filter((r) => r.hr).map((r) => [r.hr, r]));
+const teamName = (i) => (i >= 0 && DATA.teams[i] ? DATA.teams[i].name : 'Free agent');
+const money = (v) => (v == null ? '' : v >= 1e6 ? '$' + (v / 1e6).toFixed(v % 1e6 ? 2 : 1).replace(/\.?0+$/, '') + 'M' : '$' + Math.round(v / 1000) + 'K');
+const f2 = (v) => (v == null || !Number.isFinite(v) ? '' : v.toFixed(2));
+
+/* heat: diverging blue(+)/orange(-) around 0, saturating at +-3.5 SAR; numbers always printed (never colour-alone) */
+function heat(v) {
+  if (v == null || !Number.isFinite(v)) return '';
+  const a = Math.min(Math.abs(v) / 3.5, 1) * 0.62;
+  return `background:rgba(var(--${v >= 0 ? 'pos' : 'neg'}),${a.toFixed(3)})`;
+}
+
+/* ------------------------------------------------------------------ compute */
+let C = null;
+function seasons() { return S.win === 'blend' ? DATA.seasons : [S.win]; }
+function compute() {
+  const ss = seasons(), sk = [], gk = [];
+  for (const p of DATA.players) {
+    const r = rosterByHr.get(p.id) || null;
+    const base = { p, r, id: p.id, name: p.n, grp: p.g === 'D' ? 'D' : p.g === 'G' ? 'G' : 'F', tm: p.tm, age: r && r.age != null ? r.age : p.age,
+                   owner: r ? r.t : -1, st: r ? r.st : null, aav: r ? r.aav : null, ct: r ? r.ct : null, yrs: r ? r.yrs : null };
+    base.pool = S.pool === 'sheet' ? !!(r && r.real) : !!r;
+    base.fa = !r;
+    if (p.g === 'G') { const w = goalieWindow(p, ss); if (w && w.GP > 0) gk.push(Object.assign(base, w)); }
+    else { const w = skaterWindow(p, ss); if (w && w.GP > 0) { base.GP = w.GP; base.tot = w; base.pg = perGame(w, base.grp); sk.push(base); } }
+  }
+  const P = skaterParams(sk); scoreSkaters(sk, P, S.floor, S.gpCat);
+  const PG = goalieParams(gk); scoreGoalies(gk, PG, Math.max(S.floor, G_MIN_GP));
+  const defAav = DATA.defaultAav, rows = sk.concat(gk);
+  for (const r of rows) { r.aavEff = r.aav != null ? r.aav : defAav; r.perM = Number.isFinite(r.tSAR) ? r.tSAR / (r.aavEff / 1e6) : NaN; }
+  const med = {};
+  for (const g of ['F', 'D', 'G']) med[g] = median(rows.filter((r) => r.grp === g && r.owner >= 0 && Number.isFinite(r.perM)).map((r) => r.perM));
+  for (const r of rows) {
+    r.mkt = Number.isFinite(r.tSAR) && med[r.grp] > 0 ? Math.max(xlRound(r.tSAR / med[r.grp] * 1e6, -5), 1e6) : NaN;
+    r.cv = r.aav != null && Number.isFinite(r.mkt) ? (r.mkt - r.aav) / r.mkt : NaN;
+  }
+  C = { sk, gk, rows, P, PG, med };
+  // team x category contribution (Active-slot skaters): sum of SAA per category
+  C.team = DATA.teams.map(() => ({}));
+  for (const r of sk) {
+    if (r.owner < 0 || r.st !== 'Active') continue;
+    for (const c of ALL_SK) if (r.saa[c] != null) C.team[r.owner][c] = (C.team[r.owner][c] || 0) + r.saa[c];
+  }
+}
+
+/* ------------------------------------------------------------------ UI: controls & tabs */
+function seg(id, opts, cur) {
+  return `<div class="seg" id="${id}">` + opts.map(([v, l]) => `<button data-v="${esc(v)}" class="${String(cur) === String(v) ? 'on' : ''}">${esc(l)}</button>`).join('') + '</div>';
+}
+function drawControls() {
+  const lab = DATA.seasonLabel;
+  $('#controls').innerHTML = `
+   <div class="ctl">Stat window${seg('win', [['blend', 'Blend ' + lab[DATA.seasons[0]].slice(2) + ' + ' + lab[DATA.seasons[1]].slice(2)], [DATA.seasons[1], lab[DATA.seasons[1]]], [DATA.seasons[0], lab[DATA.seasons[0]]]], S.win)}</div>
+   <div class="ctl">Min games to rank <input type="number" id="floor" min="0" max="82" value="${S.floor}"></div>
+   <div class="ctl">Median / SD pool${seg('pool', [['sheet', 'Real contracts (sheet)'], ['owned', 'All owned players']], S.pool)}</div>
+   <div class="ctl">GP counts as a category${seg('gpCat', [['true', 'Yes (sheet)'], ['false', 'No']], String(S.gpCat))}</div>
+   <div class="ctl">Team<select id="team">${DATA.teams.map((t, i) => `<option value="${i}" ${i === S.team ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select></div>`;
+  $('#win').onclick = (e) => { const v = e.target.dataset.v; if (v) { S.win = v; store.set('win', v); refresh(); } };
+  $('#pool').onclick = (e) => { const v = e.target.dataset.v; if (v) { S.pool = v; store.set('pool', v); refresh(); } };
+  $('#gpCat').onclick = (e) => { const v = e.target.dataset.v; if (v) { S.gpCat = v === 'true'; store.set('gpCat', S.gpCat); refresh(); } };
+  $('#floor').onchange = (e) => { S.floor = Math.max(0, +e.target.value || 0); store.set('floor', S.floor); refresh(); };
+  $('#team').onchange = (e) => { S.team = +e.target.value; store.set('team', S.team); drawPanel(); };
+}
+const TABS = [['players', 'Players'], ['needs', 'Team needs'], ['teams', 'Rosters'], ['cap', 'Cap'], ['prospects', 'Prospects'], ['changes', 'Recent changes'], ['method', 'Method & checks']];
+function drawTabs() {
+  $('#tabs').innerHTML = TABS.map(([k, l]) => `<button data-k="${k}" class="${S.tab === k ? 'on' : ''}">${l}</button>`).join('');
+  $('#tabs').onclick = (e) => { const k = e.target.dataset.k; if (k) { S.tab = k; store.set('tab', k); drawTabs(); drawPanel(); } };
+}
+function refresh() { compute(); drawControls(); drawPanel(); }
+function drawPanel() { ({ players: tabPlayers, needs: tabNeeds, teams: tabTeams, cap: tabCap, prospects: tabProspects, changes: tabChanges, method: tabMethod })[S.tab](); }
+
+/* ------------------------------------------------------------------ shared pieces */
+function legend() {
+  const steps = [-3.5, -2, -0.7, 0, 0.7, 2, 3.5];
+  return `<div class="legend">Category SAR (std devs vs. replacement):<span class="ramp">${steps.map((v) => `<i style="${heat(v)}"></i>`).join('')}</span><span>below ← 0 → above replacement. Numbers are always shown.</span></div>`;
+}
+function ownerPill(r) {
+  if (r.owner < 0) return '<span class="pill fa">FA</span>';
+  const ir = r.st === 'Inj Res' ? ' <span class="pill ir">IR</span>' : r.st === 'Minors' ? ' <span class="pill">Min</span>' : '';
+  return esc(DATA.teams[r.owner].name) + ir;
+}
+function sortRows(rows, k, dir) {
+  const val = (r) => (k === 'name' ? r.name.toLowerCase() : k === 'owner' ? teamName(r.owner) : k === 'aav' ? r.aavEff : k === 'age' ? r.age : k === 'GP' && !r.sar ? r.GP :
+    k.startsWith('c:') ? (r.sar[k.slice(2)] ?? -1e9) : r[k]);
+  return rows.slice().sort((a, b) => {
+    let x = val(a), y = val(b);
+    const nx = typeof x === 'number' && !Number.isFinite(x), ny = typeof y === 'number' && !Number.isFinite(y);
+    if (nx || ny) return nx === ny ? 0 : nx ? 1 : -1;       // unranked always last
+    return (x < y ? -1 : x > y ? 1 : 0) * dir;
+  });
+}
+function catHeaders(cats, prefix) {
+  return cats.map((c) => `<th class="heat ${S.sort.k === 'c:' + c ? 'on' : ''}" data-k="c:${c}" title="${esc(CAT_HELP[c] || c)} - click to sort by SAR in this category">${CAT_LABEL[c]}${S.sort.k === 'c:' + c ? (S.sort.dir < 0 ? ' ▾' : ' ▴') : ''}</th>`).join('');
+}
+function catCells(r, cats) {
+  return cats.map((c) => { const v = r.sar ? r.sar[c] : null; return `<td class="heat" style="${heat(v)}">${f2(v)}</td>`; }).join('');
+}
+function hookSort(root, redraw) {
+  root.querySelectorAll('th[data-k]').forEach((th) => th.onclick = () => {
+    const k = th.dataset.k; S.sort = { k, dir: S.sort.k === k ? -S.sort.dir : (k === 'name' || k === 'owner' ? 1 : -1) }; redraw();
+  });
+}
+
+/* ------------------------------------------------------------------ Players */
+function tabPlayers() {
+  if (!C.rows.length) { $('#panel').innerHTML = '<div class="empty">No player stats are loaded yet. The hourly job loads them from Hockey-Reference; if this page was just created, run the "Fantasy dashboard" workflow once from the Actions tab.</div>'; return; }
+  const goalies = S.grp === 'G';
+  const cats = goalies ? G_CATS : S.grp === 'F' ? SK_CATS_F : ALL_SK;
+  let rows = C.rows.filter((r) => (S.grp === 'ALL' ? r.grp !== 'G' : r.grp === S.grp));
+  rows = rows.filter((r) => S.owner === 'ALL' || (S.owner === 'FA' ? r.owner < 0 : S.owner === 'OWNED' ? r.owner >= 0 : r.owner === +S.owner));
+  if (S.q) { const q = S.q.toLowerCase(); rows = rows.filter((r) => r.name.toLowerCase().includes(q)); }
+  const unranked = rows.filter((r) => !Number.isFinite(r.tSAR)).length;
+  rows = sortRows(rows, S.sort.k, S.sort.dir);
+  const shown = rows.slice(0, S.limit);
+  let rank = 0;
+  const ranks = new Map(); sortRows(C.rows.filter((r) => (S.grp === 'G' ? r.grp === 'G' : r.grp !== 'G') && Number.isFinite(r.tSAR)), 'tSAR', -1).forEach((r, i) => ranks.set(r, i + 1));
+  $('#panel').innerHTML = `
+   <div class="controls" style="border:0;padding-top:0">
+     <div class="ctl">Position${seg('grp', [['ALL', 'All skaters'], ['F', 'F'], ['D', 'D'], ['G', 'G']], S.grp)}</div>
+     <div class="ctl">Owner<select id="owner"><option value="ALL">Everyone</option><option value="FA" ${S.owner === 'FA' ? 'selected' : ''}>Free agents only</option><option value="OWNED" ${S.owner === 'OWNED' ? 'selected' : ''}>Owned only</option>
+        ${DATA.teams.map((t, i) => `<option value="${i}" ${String(S.owner) === String(i) ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select></div>
+     <div class="ctl">Search<input type="search" id="q" value="${esc(S.q)}" placeholder="player name"></div>
+   </div>
+   ${legend()}
+   <div class="note">${rows.length} players${unranked ? ` (${unranked} below the ${goalies ? Math.max(S.floor, G_MIN_GP) : S.floor}-game minimum shown unranked at the bottom)` : ''}. Click any column to sort - the category columns sort by that category's SAR.
+   Free-agent replacement level: F median ≈ ${C.P.F.nRepl} players above ${C.P.F.threshold} GP, D ≈ ${C.P.D.nRepl} above ${C.P.D.threshold} GP.</div>
+   <div class="tbl"><table id="ptbl"><thead><tr>
+     <th class="l">#</th><th class="l ${S.sort.k === 'name' ? 'on' : ''}" data-k="name">Player</th><th class="l">Pos</th><th class="l">NHL</th>
+     <th data-k="age">Age</th><th class="l ${S.sort.k === 'owner' ? 'on' : ''}" data-k="owner">Owner</th><th data-k="aav">AAV</th>
+     <th data-k="GP" class="${S.sort.k === 'GP' ? 'on' : ''}">GP</th>
+     <th data-k="tSAR" class="${S.sort.k === 'tSAR' ? 'on' : ''}" title="sum of category SAR">tSAR${S.sort.k === 'tSAR' ? (S.sort.dir < 0 ? ' ▾' : ' ▴') : ''}</th>
+     <th data-k="tSAA" title="sum of category SAA (vs. average)">tSAA</th><th data-k="perM" title="tSAR per $1M of AAV">SAR/$m</th><th data-k="mkt" title="market value implied by tSAR">Mkt $</th><th data-k="cv" title="(market - AAV) / market">Value</th>
+     ${catHeaders(cats)}</tr></thead><tbody>
+     ${shown.map((r) => `<tr><td class="l dim">${ranks.get(r) || ''}</td><td class="l name">${esc(r.name)}</td><td class="l">${esc(r.p.pos || r.grp)}</td><td class="l dim">${esc(r.tm)}</td>
+       <td>${r.age ?? ''}</td><td class="l">${ownerPill(r)}</td><td>${r.aav != null ? money(r.aav) : '<span class="dim">$1M</span>'}</td><td>${r.GP}</td>
+       <td><b>${f2(r.tSAR)}</b></td><td class="dim">${f2(r.tSAA)}</td><td>${f2(r.perM)}</td><td>${Number.isFinite(r.mkt) ? money(r.mkt) : ''}</td>
+       <td class="${r.cv > 0.25 ? '' : 'dim'}">${Number.isFinite(r.cv) ? Math.round(r.cv * 100) + '%' : ''}</td>${catCells(r, cats)}</tr>`).join('')}
+   </tbody></table></div>
+   ${rows.length > S.limit ? `<div class="note"><button id="more">Show ${Math.min(500, rows.length - S.limit)} more</button></div>` : ''}`;
+  $('#grp').onclick = (e) => { const v = e.target.dataset.v; if (v) { S.grp = v; if (v === 'G' && S.sort.k.startsWith('c:')) S.sort = { k: 'tSAR', dir: -1 }; tabPlayers(); } };
+  $('#owner').onchange = (e) => { S.owner = e.target.value; tabPlayers(); };
+  $('#q').oninput = (e) => { S.q = e.target.value; clearTimeout(tabPlayers.t); tabPlayers.t = setTimeout(() => { tabPlayers(); const q = $('#q'); q.focus(); q.setSelectionRange(q.value.length, q.value.length); }, 200); };
+  const m = $('#more'); if (m) m.onclick = () => { S.limit += 500; tabPlayers(); };
+  hookSort($('#ptbl'), tabPlayers);
+}
+
+/* ------------------------------------------------------------------ Team needs */
+function tabNeeds() {
+  const t = S.team;
+  const rank = {}, avg = {};
+  for (const c of ALL_SK) {
+    const vals = DATA.teams.map((_, i) => C.team[i][c] || 0);
+    avg[c] = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const order = vals.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]);
+    rank[c] = {}; order.forEach(([v, i], k) => (rank[c][i] = k + 1));
+  }
+  const n = DATA.teams.length, rk = (r) => `rgba(var(--${r <= n / 3 ? 'pos' : r > 2 * n / 3 ? 'neg' : 'pos'}),${(r <= n / 3 ? (n / 3 - r + 1) / (n / 3) * 0.5 : r > 2 * n / 3 ? (r - 2 * n / 3) / (n / 3) * 0.5 : 0).toFixed(3)})`;
+  const catRows = ALL_SK.filter((c) => c !== 'GP').map((c) => {
+    const v = C.team[t][c] || 0, r = rank[c][t];
+    return `<tr class="need ${S.need === c ? 'pick' : ''}" data-c="${c}"><td class="l name">${CAT_LABEL[c]} <span class="dim">${esc(CAT_HELP[c] || '')}</span></td><td>${f2(v)}</td><td>${f2(avg[c])}</td><td style="background:${rk(r)}">${r} / ${n}</td></tr>`;
+  }).join('');
+  const isD = (r) => r.grp === 'D';
+  const list = (grp) => C.sk.filter((r) => r.owner < 0 && Number.isFinite(r.tSAR) && r.sar[S.need] != null && (grp === 'D' ? isD(r) : !isD(r)))
+    .sort((a, b) => b.sar[S.need] - a.sar[S.need]).slice(0, 12);
+  const fa = (grp) => `<h3>Best free-agent ${grp === 'D' ? 'defensemen' : 'forwards'} in ${CAT_LABEL[S.need]}</h3><div class="tbl"><table><thead><tr><th class="l">Player</th><th class="l">NHL</th><th>GP</th><th>${CAT_LABEL[S.need]} SAR</th><th>per game</th><th>tSAR</th></tr></thead><tbody>` +
+    list(grp).map((r) => `<tr><td class="l name">${esc(r.name)}</td><td class="l dim">${esc(r.tm)}</td><td>${r.GP}</td><td style="${heat(r.sar[S.need])}"><b>${f2(r.sar[S.need])}</b></td><td>${S.need === 'GP' ? r.GP : f2(r.pg[S.need])}</td><td>${f2(r.tSAR)}</td></tr>`).join('') + '</tbody></table></div>';
+  const gl = C.gk.filter((r) => r.owner < 0 && Number.isFinite(r.tSAR)).sort((a, b) => b.tSAR - a.tSAR).slice(0, 5);
+  $('#panel').innerHTML = `<div class="note"><b>${esc(DATA.teams[t].name)}</b>: each category is the sum of SAA (vs. league-average skater) over the team's Active-slot skaters.
+    Rank 1 = strongest of ${n} teams. <b>Click a category</b> to list the best free agents in it.</div>
+    <div class="two"><div><div class="tbl"><table><thead><tr><th class="l">Category</th><th>Team</th><th>League avg</th><th>Rank</th></tr></thead><tbody>${catRows}</tbody></table></div>
+      <h3>Top free-agent goalies</h3><div class="tbl"><table><thead><tr><th class="l">Player</th><th>GP</th><th>tSAR</th></tr></thead><tbody>${gl.map((r) => `<tr><td class="l name">${esc(r.name)} <span class="dim">${esc(r.tm)}</span></td><td>${r.GP}</td><td>${f2(r.tSAR)}</td></tr>`).join('')}</tbody></table></div></div>
+    <div>${fa('F')}${fa('D')}</div></div>`;
+  document.querySelectorAll('.need').forEach((tr) => (tr.onclick = () => { S.need = tr.dataset.c; tabNeeds(); }));
+}
+
+/* ------------------------------------------------------------------ Rosters */
+function tabTeams() {
+  const t = S.team, mine = DATA.roster.filter((r) => r.t === t);
+  const byHr = new Map(C.rows.map((r) => [r.id, r]));
+  const block = (g, title, cats) => {
+    const rows = mine.filter((r) => r.g === g && r.st !== 'Minors').map((r) => ({ r, s: byHr.get(r.hr) })).sort((a, b) => (b.s && b.s.tSAR || -99) - (a.s && a.s.tSAR || -99));
+    const tot = rows.reduce((a, x) => a + (x.s && Number.isFinite(x.s.tSAR) ? x.s.tSAR : 0), 0), aav = rows.reduce((a, x) => a + (x.r.st === 'Inj Res' ? 0 : (x.r.aav ?? DATA.defaultAav)), 0);
+    return `<tr class="sep"><td colspan="${9 + cats.length}">${title} - ${rows.length} players, AAV ${money(aav)}, total SAR ${f2(tot)}</td></tr>` +
+      rows.map(({ r, s }) => `<tr><td class="l name">${esc(r.n)}</td><td class="l dim">${esc(r.tm || '')}</td><td>${r.age ?? ''}</td><td class="l">${r.st === 'Inj Res' ? '<span class="pill ir">IR</span>' : r.st === 'Reserve' ? '<span class="pill">Res</span>' : ''}</td>
+        <td>${r.aav != null ? money(r.aav) : '<span class="dim">$1M</span>'}</td><td>${r.yrs ?? ''}</td><td class="dim">${esc(r.ct || '')}</td><td>${s ? s.GP : ''}</td><td><b>${s ? f2(s.tSAR) : ''}</b></td>${s ? catCells(s, cats) : cats.map(() => '<td></td>').join('')}</tr>`).join('');
+  };
+  const head = (cats) => `<tr><th class="l">Player</th><th class="l">NHL</th><th>Age</th><th class="l"></th><th>AAV</th><th>Yrs</th><th>Type</th><th>GP</th><th>tSAR</th>${cats.map((c) => `<th class="heat">${CAT_LABEL[c]}</th>`).join('')}</tr>`;
+  $('#panel').innerHTML = `<div class="note">${esc(DATA.teams[t].name)} - active, reserve and IR players (minors-slot players are on the Prospects tab). Categories shown as SAR; window and floor as set above.</div>${legend()}
+    <div class="tbl"><table><thead>${head(SK_CATS_F)}</thead><tbody>${block('F', 'Forwards', SK_CATS_F)}</tbody></table></div>
+    <h3>&nbsp;</h3><div class="tbl"><table><thead>${head(SK_CATS_D)}</thead><tbody>${block('D', 'Defensemen', SK_CATS_D)}</tbody></table></div>
+    <h3>&nbsp;</h3><div class="tbl"><table><thead>${head(G_CATS)}</thead><tbody>${block('G', 'Goalies', G_CATS)}</tbody></table></div>`;
+}
+
+/* ------------------------------------------------------------------ Cap */
+function tabCap() {
+  const cap = DATA.cap, L = cap.labels, t = S.team, T = cap.teams[t];
+  const col = (v) => `rgba(var(--${v >= 0 ? 'pos' : 'neg'}),${Math.min(Math.abs(v) / 60e6, 1) * 0.55})`;
+  const matrix = cap.teams.map((x, i) => `<tr class="${i === t ? 'need pick' : 'need'}" data-t="${i}"><td class="l name">${esc(DATA.teams[i].name)}</td>${L.map((_, y) => `<td style="background:${col(x.space[y])}">${money(x.space[y])}</td>`).join('')}<td class="dim">${money(x.real[0])}</td></tr>`).join('');
+  const line = (lbl, arr, neg) => `<tr><td class="l">${lbl}</td>${arr.map((v) => `<td>${v ? (neg ? '−' : '') + money(v) : '<span class="dim">–</span>'}</td>`).join('')}</tr>`;
+  const maxAav = Math.max(1, ...T.players.map((p) => p.aav));
+  $('#panel').innerHTML = `<div class="note">Cap space by season (cap − active salary − 50% of cut players' salary). IR players count against future seasons but not the current one; minors-slot players carry no cap hit; players with no contract on file count as $1M free-agent contracts. "Real" adds back salary you could cut for free (default $1M contracts). Click a team to see its contracts.</div>
+   <div><div class="tbl" style="max-height:none"><table><thead><tr><th class="l">Cap space</th>${L.map((l) => `<th>${l}</th>`).join('')}<th title="this season, adding back free cuts">Real ${L[0].slice(2)}</th></tr></thead><tbody>
+     <tr class="sep"><td class="l">Salary cap</td>${cap.caps.map((v) => `<td>${money(v)}</td>`).join('')}<td></td></tr>${matrix}</tbody></table></div>
+   <h3>${esc(DATA.teams[t].name)}</h3><div><div class="tbl" style="max-height:none"><table><thead><tr><th class="l">Season</th>${L.map((l) => `<th>${l}</th>`).join('')}</tr></thead><tbody>
+     ${line('Active salary', T.active)}${line('Injured reserve', T.ir)}${line('Dead / cut', T.dead, true)}${line('Cap space', T.space)}${line('Real space', T.real)}
+     </tbody></table></div>
+     <h3>Contracts</h3><div class="tbl"><table><thead><tr><th class="l">Player</th><th>AAV</th><th>Yrs</th><th class="l"></th>${L.map((l) => `<th>${l.slice(2)}</th>`).join('')}</tr></thead><tbody>
+     ${T.players.map((p) => `<tr><td class="l name">${esc(p.n)}</td><td>${money(p.aav)}</td><td>${p.yrs}</td><td class="l">${p.st === 'Inj Res' ? '<span class="pill ir">IR</span>' : p.free ? '<span class="pill">free cut</span>' : ''}</td>${p.per.map((v) => `<td>${v ? `<span class="bar" style="width:${Math.max(3, v / maxAav * 40)}px"></span>` : ''}</td>`).join('')}</tr>`).join('')}
+     ${T.cuts.map((p) => `<tr><td class="l name dim">${esc(p.n)} (cut)</td><td class="dim">${money(p.aav)}</td><td>${p.yrs}</td><td class="l"><span class="pill">dead 50%</span></td>${p.per.map((v) => `<td class="dim">${v ? money(v) : ''}</td>`).join('')}</tr>`).join('')}
+     </tbody></table></div></div></div>`;
+  document.querySelectorAll('.need[data-t]').forEach((tr) => (tr.onclick = () => { S.team = +tr.dataset.t; store.set('team', S.team); drawControls(); tabCap(); }));
+}
+
+/* ------------------------------------------------------------------ Prospects */
+function tabProspects() {
+  const t = S.team, n = DATA.teams.length;
+  const avg = (list, f) => { const v = list.map(f).filter((x) => x != null && Number.isFinite(x)); return v.length ? v.reduce((p, q) => p + q, 0) / v.length : NaN; };
+  const grads = (list) => list.filter((p) => p.gp > 20).length + list.filter((p) => p.lvl === 'NHL' && p.cert === 10).length;
+  const grp = (list) => ({ up: avg(list, (p) => p.up), ce: avg(list, (p) => p.cert), n: list.filter((p) => p.cert > 0).length, grad: grads(list), all: list.length });
+  const rows = DATA.teams.map((tm, i) => {
+    const l = DATA.prospects.filter((p) => p.t === i), g = { F: grp(l.filter((p) => p.g === 'F')), D: grp(l.filter((p) => p.g === 'D')), G: grp(l.filter((p) => p.g === 'G')) };
+    const w = g.F.n + g.D.n + g.G.n, wavg = (k) => (w ? ['F', 'D', 'G'].reduce((a, x) => a + (Number.isFinite(g[x][k]) ? g[x][k] * g[x].n : 0), 0) / w : NaN);
+    return { i, g, up: wavg('up'), ce: wavg('ce'), star: l.filter((p) => p.up >= 9 && p.cert >= 9).length, maybe: l.filter((p) => p.up >= 9 && p.cert < 9).length, lock: l.filter((p) => p.up < 9 && p.cert >= 9).length,
+             a1: l.filter((p) => p.age >= 18 && p.age <= 19).length, a2: l.filter((p) => p.age >= 20 && p.age <= 22).length, a3: l.filter((p) => p.age >= 23).length, grad: g.F.grad + g.D.grad + g.G.grad };
+  });
+  const fm = (v) => (Number.isFinite(v) ? v.toFixed(2) : '');
+  const hc = (v, mid) => `style="${heat((v - mid) * 1.1)}"`;
+  const summary = rows.map((r) => `<tr class="${r.i === t ? 'need pick' : 'need'}" data-t="${r.i}"><td class="l name">${esc(DATA.teams[r.i].name)}</td>
+     <td ${hc(r.up, 7)}>${fm(r.up)}</td><td>${fm(r.g.F.up)}</td><td>${fm(r.g.D.up)}</td><td>${fm(r.g.G.up)}</td>
+     <td ${hc(r.ce, 6.5)}>${fm(r.ce)}</td><td>${fm(r.g.F.ce)}</td><td>${fm(r.g.D.ce)}</td><td>${fm(r.g.G.ce)}</td>
+     <td>${r.g.F.n}</td><td>${r.g.D.n}</td><td>${r.g.G.n}</td><td>${r.star}</td><td>${r.maybe}</td><td>${r.lock}</td><td>${r.a1}</td><td>${r.a2}</td><td>${r.a3}</td><td>${r.grad}</td><td>${money(r.grad * 1e6)}</td></tr>`).join('');
+  const mine = DATA.prospects.filter((p) => p.t === t).sort((a, b) => (b.up * 10 + b.cert) - (a.up * 10 + a.cert));
+  const eta = DATA.etaYears || {};
+  $('#panel').innerHTML = `<div class="note">Depth summary as in your workbook. Stars = upside ≥ 9 and certainty ≥ 9; maybe = upside ≥ 9, certainty &lt; 9; locks = upside &lt; 9, certainty ≥ 9. Graduate potential = prospects with &gt; 20 NHL GP plus NHL-level prospects with certainty 10; lost cap = graduates × $1M. Click a team to list its prospects.</div>
+   <div class="tbl"><table><thead><tr><th class="l">Team</th><th>Upside</th><th>F</th><th>D</th><th>G</th><th>Certainty</th><th>F</th><th>D</th><th>G</th><th title="prospects with certainty &gt; 0">#F</th><th>#D</th><th>#G</th><th>Stars</th><th>Maybe</th><th>Locks</th><th>18-19</th><th>20-22</th><th>23+</th><th>Grads</th><th>Lost cap</th></tr></thead><tbody>${summary}</tbody></table></div>
+   <h3>${esc(DATA.teams[t].name)} prospects</h3>
+   <div class="tbl"><table><thead><tr><th class="l">Player</th><th class="l">Pos</th><th>Age</th><th class="l">Level</th><th>ETA yrs</th><th>Upside</th><th>Certainty</th><th>NHL GP</th><th class="l">Trajectory</th><th class="l">Next season</th></tr></thead><tbody>
+   ${mine.map((p) => `<tr><td class="l name">${esc(p.n)}</td><td class="l">${esc(p.g)}</td><td>${p.age ?? ''}</td><td class="l">${esc(p.lvl || '')}</td><td>${eta[p.lvl] ?? ''}</td><td style="${heat((p.up - 7) * 1.2)}">${p.up ?? ''}</td><td style="${heat((p.cert - 5) * .6)}">${p.cert ?? ''}</td><td>${p.gp || ''}</td><td class="l">${esc(p.traj || '')}</td><td class="l">${esc(p.nxt || '')}</td></tr>`).join('')}</tbody></table></div>`;
+  document.querySelectorAll('.need[data-t]').forEach((tr) => (tr.onclick = () => { S.team = +tr.dataset.t; store.set('team', S.team); drawControls(); tabProspects(); }));
+}
+
+/* ------------------------------------------------------------------ Changes */
+function tabChanges() {
+  const ch = DATA.changes;
+  const d = (s) => { const x = new Date(s); return isNaN(x) ? s : x.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); };
+  $('#panel').innerHTML = ch.length ? `<div class="note">Roster moves detected from Fantrax (checked hourly). Times are when the change was detected.</div>
+    <div class="tbl"><table><thead><tr><th class="l">Detected</th><th class="l">Move</th><th class="l">Player</th><th class="l">From</th><th class="l">To</th><th class="l">Status</th></tr></thead><tbody>
+    ${ch.map((c) => `<tr><td class="l dim">${esc(d(c.at))}</td><td class="l">${esc(c.ev)}</td><td class="l name">${esc(c.p)} <span class="dim">${esc(c.nhl || '')} ${esc(c.pos || '')}</span></td><td class="l">${esc(c.frm || '')}</td><td class="l">${esc(c.to || '')}</td><td class="l dim">${esc([c.fs, c.ts].filter(Boolean).join(' → '))}</td></tr>`).join('')}</tbody></table></div>`
+    : '<div class="empty">No roster changes detected yet - the first ones will appear here as soon as someone adds, drops or trades a player.</div>';
+}
+
+/* ------------------------------------------------------------------ Method */
+function tabMethod() {
+  const row = (g, P) => (g === 'G' ? G_CATS : SKC[g]).map((c) => `<tr><td class="l">${g} · ${CAT_LABEL[c]}</td><td>${P[c].med.toFixed(c === 'SV' ? 3 : 2)}</td><td>${P[c].sd.toFixed(c === 'SV' ? 4 : 3)}</td><td>${P[c].repl.toFixed(c === 'SV' ? 3 : 2)}</td></tr>`).join('');
+  $('#panel').innerHTML = `<div class="two"><div>
+   <h3>How the numbers work (same as your workbook)</h3>
+   <div class="note"><b>Per-game stats</b> are rounded to 2 decimals (PT-D for defensemen only, G, A, 2G+A, PIM, SOG, STP, Hit, Blk, TK, Cor); GP is used as a total. <b>Cor</b> = CF − CF against.<br>
+   <b>SAA</b> = (player − median) ÷ SD, where median and SD come from the pool of players (forwards and defensemen separately). <b>SAR</b> = (player − replacement) ÷ SD, where replacement is the median of free agents who played more than the 25th-percentile of free-agent games. Totals (tSAA / tSAR) are the sums over categories. Goalies use GP, W, GAA (lower is better), SV% and SHO, with a 5-game minimum.<br>
+   <b>Blend</b> pools both seasons' totals, so a player's per-game rate is weighted by games played; choosing a single season reproduces the workbook exactly. <b>Min games to rank</b> hides tSAR for small samples but never changes the medians, SDs or replacement levels.<br>
+   <b>Cor fix:</b> the workbook's Corsi lookup stopped at row 1011 of a 1063-row table, so ~50 players near the end of the alphabet showed Cor = 0. Here every stat is joined on the Hockey-Reference player ID, so that can't happen.<br>
+   <b>Market $</b> = tSAR ÷ the median SAR-per-$M of owned players at that position × $1M (floor $1M); <b>Value</b> = (market − AAV) ÷ market.</div>
+   <h3>Choices you can flip</h3>
+   <div class="note"><b>Pool = Real contracts</b> uses owned players on a negotiated contract for the median/SD, as the workbook did, but without the $0.1M prospect placeholders (Fantrax ownership now keeps prospects off the free-agent list, so the placeholder isn't needed). Players picked up as $1M free agents are excluded, as in the workbook. <b>All owned players</b> uses everyone currently on a team, prospects included. Free agents (replacement pool) are always players not on any Fantrax roster.</div>
+   <h3>Data</h3>
+   <div class="note">Stats: Hockey-Reference season tables (updated ${esc(DATA.asof.stats || 'n/a')}). Rosters: Fantrax (${esc(DATA.asof.roster || 'n/a')}).<br>
+   ${C.sk.length} skaters and ${C.gk.length} goalies with games in the selected window.</div></div>
+   <div><h3>Parameters in use (window: ${S.win === 'blend' ? 'blend' : DATA.seasonLabel[S.win]})</h3>
+   <div class="note">Pools - F: ${C.P.F.nPool} median/SD, ${C.P.F.nRepl} replacement (> ${C.P.F.threshold} GP). D: ${C.P.D.nPool}, ${C.P.D.nRepl} (> ${C.P.D.threshold}). G: ${C.PG.nPool}, ${C.PG.nRepl} (> ${C.PG.threshold}).</div>
+   <div class="tbl"><table><thead><tr><th class="l">Category</th><th>Median</th><th>SD</th><th>Replacement</th></tr></thead><tbody>${row('F', C.P.F)}${row('D', C.P.D)}${row('G', C.PG)}</tbody></table></div></div></div>`;
+}
+
+/* ------------------------------------------------------------------ boot */
+$('#title').textContent = DATA.league;
+$('#asof').textContent = 'Stats updated ' + (DATA.asof.stats ? new Date(DATA.asof.stats).toLocaleString() : 'n/a') + ' · rosters ' + (DATA.asof.roster ? new Date(DATA.asof.roster).toLocaleString() : 'n/a');
+drawTabs(); refresh();
+</script>
+</body>
+</html>
