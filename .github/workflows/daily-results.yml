@@ -1,8 +1,14 @@
 name: NHL Daily Results Ingest
 
+# Runs early so yesterday's results (and the dashboard that follows) are in well before the day's games.
+# Yesterday's last games end by ~1:30am ET, so anything after that is safe. GitHub's scheduler routinely
+# starts jobs late, and the top of the hour is the worst-delayed slot, so both entries use odd minutes.
+# The second entry is a backup for a delayed or dropped first run; the ingest skips games it already has,
+# so a second run that finds nothing new is harmless.
 on:
   schedule:
-    - cron: '0 13 * * *'  # 13:00 UTC daily (~8-9am ET) — timing doesn't matter for this job
+    - cron: '23 8 * * *'   # 08:23 UTC = 3:23am ET (EST) / 4:23am ET (EDT)
+    - cron: '47 9 * * *'   # backup, 09:47 UTC = 4:47am ET (EST) / 5:47am ET (EDT)
   workflow_dispatch:
     inputs:
       dry_run:
@@ -18,6 +24,15 @@ on:
         required: false
         default: ''
         type: string
+
+permissions:
+  contents: read
+  actions: write   # lets the last step start the dashboard workflow
+
+# A delayed first run and the backup run must not execute at the same time.
+concurrency:
+  group: daily-results
+  cancel-in-progress: false
 
 jobs:
   ingest:
@@ -45,3 +60,14 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           INGEST_DATE: ${{ github.event.inputs.ingest_date }}
         run: python scripts/nhl_daily_results_ingest.py
+
+      # Regenerate the dashboard as soon as the ingest finishes (the ingest refreshes the materialized views
+      # itself before it exits, so the dashboard reads the new games). Runs even if the ingest exited with an
+      # error, since it may still have ingested some games first. Skipped on dry runs and cancellations.
+      # Best-effort: the dashboard's own 10-minute cron is the backup, so a failure here never fails the run.
+      - name: Refresh dashboard
+        if: ${{ !cancelled() && (github.event.inputs.dry_run || 'false') != 'true' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run dashboard.yml --repo "${{ github.repository }}"

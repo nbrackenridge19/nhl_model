@@ -23,15 +23,69 @@ Model facts this script relies on (checked against the existing rows / views):
   rookie pv comes from rookie_pv_lookup (draft round x F/D); age is not used anywhere, so it's not asked.
 """
 
+import json
 import os
+import shutil
+import subprocess
 import sys
+import urllib.request
 
 import psycopg2
 
 VALID_ROUNDS = {"1", "2", "3", "4", "5", "6", "7", "U"}
 
+REPO = "nbrackenridge19/nhl_model"
+DASHBOARD_WORKFLOW = "dashboard.yml"
+DASHBOARD_REF = "main"
+
+# Number of changes committed in this run. When it is above zero, main() starts the dashboard workflow once at the end.
+CHANGES = {"n": 0}
+
 
 # --------------------------- helpers ---------------------------
+
+def save(conn):
+    """Commit and remember that something changed, so the dashboard gets regenerated at the end of the run."""
+    conn.commit()
+    CHANGES["n"] += 1
+
+
+def refresh_dashboard():
+    """Start the 'Generate dashboard' GitHub Actions workflow so the dashboard picks up what was just saved.
+    Best-effort: a failure here is reported but never affects the data already committed.
+
+    Needs ONE of:
+      - GITHUB_TOKEN (or GH_TOKEN) set to a personal access token with Actions: read and write on the repo, or
+      - the GitHub CLI ('gh') installed and signed in (gh auth login).
+    With neither, it prints what to do by hand. The dashboard's own 10-minute schedule is the backup (7am-1am ET)."""
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    try:
+        if token:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{REPO}/actions/workflows/{DASHBOARD_WORKFLOW}/dispatches",
+                data=json.dumps({"ref": DASHBOARD_REF}).encode(),
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                         "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if resp.status == 204:
+                    print("Dashboard refresh started.")
+                    return
+                print(f"Dashboard refresh: unexpected response {resp.status}.")
+        elif shutil.which("gh"):
+            res = subprocess.run(["gh", "workflow", "run", DASHBOARD_WORKFLOW, "--repo", REPO],
+                                 capture_output=True, text=True, timeout=60)
+            if res.returncode == 0:
+                print("Dashboard refresh started.")
+                return
+            print("Dashboard refresh via gh failed: " + (res.stderr or res.stdout).strip())
+        else:
+            print("Dashboard NOT refreshed automatically: no GITHUB_TOKEN and no 'gh' found.")
+    except Exception as e:  # network, auth, timeout -- never let this hide that the data was saved
+        print(f"Dashboard refresh failed: {e}")
+    print(f"Your changes are saved. Start it by hand (GitHub > Actions > Generate dashboard > Run workflow), "
+          f"or it refreshes on its own within ~10 minutes.")
+
 
 def get_conn():
     url = os.environ.get("DATABASE_URL")
@@ -258,7 +312,7 @@ def find_existing_player(conn, name, qid, team, game_id, source=None):
         cur.execute("update player_id_review_queue set status = 'resolved', resolved_player_id = %s, "
                     "notes = 'confirmed via nhl_add_player' where id = %s", (pid, qid))
         backfill_preliminary(cur, game_id, team, pid, source)
-        conn.commit()
+        save(conn)
         print("  done.")
     return True
 
@@ -280,7 +334,7 @@ def handle_lineup_row(conn, row):
             cur.execute("update player_id_review_queue set status = 'resolved', resolved_player_id = %s, "
                         "notes = 'goalie added via nhl_add_player' where id = %s", (pid, qid))
             backfill_preliminary(cur, game_id, team, pid, source)
-            conn.commit()
+            save(conn)
             print("  done. The next goalie run will pick him up.")
         return
 
@@ -300,7 +354,7 @@ def handle_lineup_row(conn, row):
     cur.execute("update player_id_review_queue set status = 'resolved', resolved_player_id = %s, "
                 "notes = %s where id = %s", (pid, f"{entry['kind']} entered via nhl_add_player", qid))
     backfill_preliminary(cur, game_id, team, pid)
-    conn.commit()
+    save(conn)
     print("  saved.")
 
 
@@ -341,7 +395,7 @@ def link_to_provisional(conn, hr_id, hr_name):
     cur.execute("delete from players where player_id = %s", (prov_id,))
     cur.execute("update player_review_queue set status = 'resolved', notes = %s where player_id = %s",
                 (f"linked to DailyFaceoff entry {prov_name}", hr_id))
-    conn.commit()
+    save(conn)
     print("  merged.")
     return True
 
@@ -366,7 +420,7 @@ def handle_results_row(conn, row):
     write_stats(cur, name, season, entry)
     cur.execute("update player_review_queue set status = 'resolved', notes = %s where player_id = %s",
                 (f"{entry['kind']} entered via nhl_add_player", pid))
-    conn.commit()
+    save(conn)
     print("  saved.")
 
 
@@ -400,7 +454,7 @@ def handle_null_pvadj_row(conn, row):
         print("  not saved.")
         return
     write_stats(cur, name, season, entry)
-    conn.commit()
+    save(conn)
     print("  saved.")
 
 
@@ -435,6 +489,10 @@ def main():
         print(f"\nStill open: {left[0]} unmatched, {left[1]} no stats, {left[2]} results-side.")
     finally:
         conn.close()
+        # In the finally block so that stopping partway (Ctrl+C) after saving some players still refreshes it.
+        if CHANGES["n"]:
+            print(f"\n{CHANGES['n']} change(s) saved. Refreshing the dashboard...")
+            refresh_dashboard()
 
 
 if __name__ == "__main__":
