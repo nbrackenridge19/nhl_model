@@ -299,7 +299,66 @@ def next_game_ids(conn, season_code, count, playoff=False):
 
 # --------------------------- box score scraping ---------------------------
 
+SCRAPE_ATTEMPTS = 3          # total fetches of one box score when its goalie data looks incomplete
+SCRAPE_RETRY_DELAY_SECONDS = 15
+
+
+def goalie_data_issues(box, home_team, away_team):
+    """Plain-language problems that mean a team's goalie data is incomplete (empty list = looks fine).
+    Two games in 2026-27 (WPG @ TBL 10-29, EDM @ UTA 10-17) lost a goalie -- a whole player, from both the
+    skater and goalie tables -- with no warning anywhere, and the ingest has no check that catches it.
+    Empty-net time is why TOI/shots are allowed to fall a little short: the 'Empty Net' row has no player
+    link and is skipped on purpose."""
+    issues = []
+    for team, opp in ((home_team, away_team), (away_team, home_team)):
+        gr = [r for r in box["goalies"] if r["team_code"] == team]
+        if not gr:
+            issues.append(f"{team}: no goalie rows parsed")
+            continue
+        toi = sum(r["toi_seconds"] or 0 for r in gr)
+        if toi < 3000:
+            issues.append(f"{team}: goalies' total ice time is only {toi}s (a game is 3600s+)")
+        sa = sum(r["shots_against"] or 0 for r in gr)
+        opp_shots = sum(r.get("shots") or 0 for r in box["skaters"] if r["team_code"] == opp)
+        if opp_shots - sa > 4 or sa - opp_shots > 1:
+            issues.append(f"{team}: goalies faced {sa} shots but {opp} skaters took {opp_shots}")
+    return issues
+
+
 def scrape_game_box(game_id, game_date, home_team, away_team):
+    """Scrape one box score; if a team's goalie data looks incomplete, fetch the page again (up to
+    SCRAPE_ATTEMPTS times) before accepting it. Anything still wrong is reported loudly but not blocked."""
+    best, best_issues = None, None
+    for attempt in range(1, SCRAPE_ATTEMPTS + 1):
+        box = _scrape_game_box_once(game_id, game_date, home_team, away_team)
+        issues = goalie_data_issues(box, home_team, away_team)
+        if not issues:
+            if attempt > 1:
+                print(f"  NOTE {game_id}: goalie data looked incomplete on attempt 1 but was complete on attempt "
+                      f"{attempt} -- the page changed between fetches (transient), not a parsing problem")
+            return box
+        print(f"  WARNING {game_id}: goalie data looks incomplete (attempt {attempt}/{SCRAPE_ATTEMPTS}): "
+              + "; ".join(issues))
+        if best is None or len(issues) < len(best_issues):
+            best, best_issues = box, issues
+        if attempt < SCRAPE_ATTEMPTS:
+            time.sleep(SCRAPE_RETRY_DELAY_SECONDS * attempt)
+    print(f"  INTEGRITY WARNING {game_id}: goalie data still looks incomplete after {SCRAPE_ATTEMPTS} fetches -- "
+          "ingesting what was parsed; the same page parsed the same way each time, so see the 'skipped row' "
+          "lines above for the raw row that could not be read. Fix by hand: " + "; ".join(best_issues))
+    return best
+
+
+def log_skipped_row(kind, game_id, team_code, tr, reason):
+    """Rows that cannot be read are skipped, but never silently again: print the raw markup so the next
+    occurrence shows exactly what the row looked like. 'Empty Net' rows are expected and stay quiet."""
+    text = tr.get_text(" ", strip=True)
+    if not text or "empty net" in text.lower() or "thead" in (tr.get("class") or []):
+        return
+    print(f"  WARNING {game_id} {team_code}: skipped a {kind} row ({reason}): {str(tr)[:400]}")
+
+
+def _scrape_game_box_once(game_id, game_date, home_team, away_team):
     code = build_boxscore_code(game_date, home_team)
     url = BOXSCORE_URL.format(code=code)
     resp = requests.get(url, headers=HEADERS, timeout=20)
@@ -323,6 +382,9 @@ def scrape_game_box(game_id, game_date, home_team, away_team):
         adv_all_table = get_soup_table(soup, f"{t_upper}_adv_ALLAll")
         adv_5v5_table = get_soup_table(soup, f"{t_upper}_adv_ALL5v5")
 
+        for label, tbl in (("skaters", sk_table), ("goalies", go_table), ("advanced", adv_all_table)):
+            if tbl is None:
+                print(f"  WARNING {game_id} {team_code}: {label} table not found on the page")
         team_score = None
         if sk_table is not None:
             rows, total_row_goals = parse_skater_table(sk_table, game_id, team_code)
@@ -395,9 +457,11 @@ def parse_skater_table(table, game_id, team_code):
             # total_goals after the loop) -- this can't drift if HR's footer
             # markup changes again, since it doesn't depend on footer markup
             # at all.
+            log_skipped_row("skater", game_id, team_code, tr, "no player cell")
             continue
         player_id, player_name = extract_player_id(player_cell)
         if player_id is None:
+            log_skipped_row("skater", game_id, team_code, tr, "no player id in link")
             continue
         rows.append({
             "game_id": game_id, "player_id": player_id, "team_code": team_code,
@@ -424,9 +488,11 @@ def parse_goalie_table(table, game_id, team_code):
         row = {c.get("data-stat"): c.get_text(strip=True) for c in cells}
         player_cell = tr.find("td", {"data-stat": "player"})
         if player_cell is None:
+            log_skipped_row("goalie", game_id, team_code, tr, "no player cell")
             continue
         player_id, player_name = extract_player_id(player_cell)
         if player_id is None:
+            log_skipped_row("goalie", game_id, team_code, tr, "no player id in link")
             continue
         rows.append({
             "game_id": game_id, "player_id": player_id, "team_code": team_code,
@@ -458,9 +524,11 @@ def parse_advanced_table(table, game_id, team_code):
         # <th> instead of <td>.
         player_cell = tr.find(["td", "th"], {"data-stat": "player"})
         if player_cell is None:
+            log_skipped_row("advanced", game_id, team_code, tr, "no player cell")
             continue
         player_id, _ = extract_player_id(player_cell)
         if player_id is None:
+            log_skipped_row("advanced", game_id, team_code, tr, "no player id in link")
             continue
         rows.append({
             "game_id": game_id, "player_id": player_id, "team_code": team_code,
