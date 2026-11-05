@@ -348,6 +348,31 @@ def scrape_game_box(game_id, game_date, home_team, away_team):
     }
 
 
+def credit_shootout_winner(box, game_id, home_team, away_team):
+    """Final score must never be a tie. A shootout goal is not credited to any skater, so summing skater
+    goals leaves a shootout game level (e.g. 3-3). Every historical season in `games` instead records the
+    shootout winner with +1 goal (3-4), which is also how nhl.com / Hockey-Reference show the final, and
+    `win` in v_team_game_perspective is `goals > opponent goals`, so a tie makes BOTH teams 'lost'.
+    The team whose goalie has decision 'W' is the winner (the loser's goalie is 'O' for an OT/SO loss).
+    Regulation and overtime games are untouched: an overtime goal is credited to a skater, so those
+    already come out unequal."""
+    hg, ag = box["home_goals"], box["away_goals"]
+    if hg is None or ag is None or hg != ag:
+        return
+    winners = {r["team_code"] for r in box["goalies"] if r.get("decision") == "W"}
+    if len(winners) == 1 and next(iter(winners)) in (home_team, away_team):
+        winner = next(iter(winners))
+        if winner == home_team:
+            box["home_goals"] = hg + 1
+        else:
+            box["away_goals"] = ag + 1
+        print(f"  NOTE {game_id}: shootout -- {winner} credited the winning goal "
+              f"({away_team} {box['away_goals']} @ {home_team} {box['home_goals']})")
+    else:
+        print(f"  WARNING {game_id}: level at {hg}-{ag} but the winning goalie could not be identified "
+              f"(W goalies found: {sorted(winners) or 'none'}) -- stored as a tie; fix by hand")
+
+
 def parse_skater_table(table, game_id, team_code):
     rows = []
     for tr in table.find("tbody").find_all("tr"):
@@ -1063,6 +1088,7 @@ def process_date(conn, d, season, prior_season):
             print(f"  FAILED {game_id}: {e} (will be retried on the next run)")
             failures.append((d, game_id))
             continue
+        credit_shootout_winner(box, game_id, home_code, away_code)
         pp_pk = fetch_pp_pk(g["event_id"], home_code, away_code)
         if not pp_pk:
             print(f"  WARNING {game_id}: NHL.com PP/PK not found; PP/PK raw values left empty for this game")
