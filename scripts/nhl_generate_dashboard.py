@@ -533,7 +533,9 @@ def get_instances(conn, seasons=None, bank_overrides=None):
             "bets_fire": bool(bets_fire), "stake_dollar": stake_dollar, "profit_dollar": profit_dollar,
             "home_goals": home_goals, "away_goals": away_goals,
             # raw sizing inputs, so rebank() can re-price a season off a different bankroll without a re-query
-            "kf": float(kf), "lam": float(lam), "kelly_fraction": float(kelly_fraction),
+            # (nullable: kf / lambda are NULL for games with no signal, and those rows never bet)
+            "kf": float(kf) if kf is not None else None, "lam": float(lam) if lam is not None else None,
+            "kelly_fraction": float(kelly_fraction) if kelly_fraction is not None else None,
         })
     return instances
 
@@ -547,7 +549,8 @@ def rebank(instances, start_by_date):
         y = dict(x)
         y["stake_dollar"] = y["profit_dollar"] = 0.0
         bank = start_by_date.get(x["date"])
-        if y["bets_fire"] and bank is not None:
+        if (y["bets_fire"] and bank is not None and y["kf"] is not None and y["lam"] is not None
+                and y["kelly_fraction"] is not None and y["mlpct"] is not None):
             stake = y["kelly_fraction"] * y["kf"] * y["lam"] * float(bank)
             mk = y["mlpct"]
             b = (1.0 - mk) / mk if mk > 0 else 0.0
