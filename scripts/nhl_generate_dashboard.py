@@ -83,6 +83,8 @@ Its own side effect is purely local: it writes docs/index.html, which the
 workflow then commits only if the content actually changed.
 """
 
+import html as html_lib
+import json
 import math
 import os
 import sys
@@ -217,6 +219,20 @@ def get_todays_games(conn):
         return cur.fetchall()
 
 
+def get_todays_moneylines(conn, game_ids):
+    """{(game_id, team): american moneyline} actually captured with the frozen signal (bet_signals.moneyline).
+    Used for the small line shown under Market % on frozen rows. Games with no frozen row simply have no entry."""
+    out = {}
+    if not game_ids:
+        return out
+    with conn.cursor() as cur:
+        cur.execute("select game_id, team_code, moneyline from bet_signals "
+                    "where game_id = any(%s) and moneyline is not null", (list(game_ids),))
+        for gid, team, ml in cur.fetchall():
+            out[(gid, team)] = int(ml)
+    return out
+
+
 def get_todays_schedule_and_preview(conn, rows):
     """Game start times plus a PREVIEW of the signal for games with no frozen bet_signals row yet.
 
@@ -281,11 +297,12 @@ def get_todays_schedule_and_preview(conn, rows):
                 print(f"  preview {away} @ {home}: market only ({err})")
                 for team in (home, away):
                     preview[(game_id, team)] = {"fire": False, "stake": None, "mpct": None,
-                                                "mlpct": ps.mlpct_from_moneyline(ml[team][0]), "model_ok": False}
+                                                "mlpct": ps.mlpct_from_moneyline(ml[team][0]), "model_ok": False,
+                                                "ml": int(ml[team][0])}
                 continue
             for sr in sig_rows:
                 preview[(game_id, sr[1])] = {"fire": bool(sr[15]), "stake": float(sr[17]), "mpct": float(sr[9]),
-                                             "mlpct": float(sr[10]), "model_ok": True}
+                                             "mlpct": float(sr[10]), "model_ok": True, "ml": int(ml[sr[1]][0])}
         except Exception as e:  # noqa: BLE001
             conn.rollback()
             print(f"  preview {away} @ {home}: skipped ({e})")
@@ -618,6 +635,10 @@ STYLE = (
     "th, td { padding: 10px 8px; text-align: left; font-size: 14px; border-bottom: 1px solid #eee; } "
     "th { background: #f0f0f0; font-size: 12px; text-transform: uppercase; } "
     ".tag { color: #999; font-size: 11px; } "
+    ".ml { color: #999; font-size: 11px; font-style: italic; font-weight: 400; } "
+    ".day-tip { position: fixed; display: none; z-index: 10; background: #222; color: #fff; font-size: 12px; "
+    "line-height: 1.5; padding: 8px 10px; border-radius: 6px; pointer-events: none; max-width: 320px; "
+    "box-shadow: 0 2px 8px rgba(0,0,0,.3); } "
     ".scroll-wrap { overflow-x: auto; margin-bottom: 8px; } "
     ".row-grid { display: grid; gap: 4px 10px; align-items: center; padding: 8px 12px; "
     "font-size: 12px; min-width: 820px; } "
@@ -630,6 +651,7 @@ STYLE = (
     ".block { background: white; border-radius: 0 0 8px 8px; margin-bottom: 8px; overflow: hidden; "
     "border-top: 1px solid #eee; } "
     ".block:first-of-type { border-top: none; } "
+    ".block > .row-grid + .row-grid { border-top: 1px solid #eee; } "
     ".block > summary { cursor: pointer; list-style: none; } "
     ".block > summary::-webkit-details-marker { display: none; } "
     ".block > summary::before { content: '\\25B8'; margin-right: 4px; color: #999; } "
@@ -665,43 +687,23 @@ def money(v):
     return f"{'+' if r >= 0 else '-'}${abs(r):,.0f}"
 
 
-def summary_row_html(label, s, wallet_return_pct=None, bold=False):
-    win_pct = f"{s['wins'] / s['bets_placed']:.0%}" if s["bets_placed"] else "-"
-    profit_color = "#1a7f37" if s["profit"] >= 0 else "#c0392b"
-    return_str = f"{s['return_pct']:+.1%}" if s["return_pct"] is not None else "-"
-    model_ll = f"{s['model_logloss']:.3f}" if s["model_logloss"] is not None else "-"
-    market_ll = f"{s['market_logloss']:.3f}" if s["market_logloss"] is not None else "-"
-    delta = (s["model_logloss"] - s["market_logloss"]) if (
-        s["model_logloss"] is not None and s["market_logloss"] is not None) else None
-    delta_str = f"{delta:+.3f}" if delta is not None else "-"
-    if wallet_return_pct is not None:
-        wr_color = "#1a7f37" if wallet_return_pct >= 0 else "#c0392b"
-        wallet_cell = f"<td><span style=\"color:{wr_color}; font-weight:600;\">{wallet_return_pct:+.1%}</span></td>"
-    else:
-        wallet_cell = "<td>-</td>"
-    style = "font-weight:700; border-top:2px solid #ccc;" if bold else ""
-    return (
-        f"<tr style=\"{style}\">"
-        f"<td>{label}</td><td>{s['bets_placed']}</td>"
-        f"<td>{s['wins']}-{s['losses']} ({win_pct})</td>"
-        f"<td>${s['wagered']:,.0f}</td>"
-        f"<td><span style=\"color:{profit_color}; font-weight:600;\">{money(s['profit'])}</span></td>"
-        f"<td>{return_str}</td>"
-        f"{wallet_cell}"
-        f"<td>{model_ll}</td><td>{market_ll}</td>"
-        f"<td style=\"{logloss_delta_bg(delta)}\">{delta_str}</td>"
-        "</tr>"
-    )
+def ml_from_prob(p):
+    """American moneyline implied by a win probability (the inverse of mlpct_from_moneyline), rounded to a whole
+    number. Used for the model's own implied line; also the fallback for a market line we don't have stored."""
+    if p is None or not (0.0 < p < 1.0):
+        return None
+    return -round(100.0 * p / (1.0 - p)) if p > 0.5 else round(100.0 * (1.0 - p) / p)
 
 
-def summary_table_html(header_label, rows_html):
-    return (
-        f"<div class=\"scroll-wrap\"><table><tr><th>{header_label}</th><th>Bets</th><th>Record</th>"
-        "<th>Wagered</th><th>Profit</th><th>Return</th>"
-        "<th>Wallet Return</th>"
-        "<th>LogLoss</th><th>Mkt LogLoss</th><th>LL &Delta;</th></tr>"
-        f"{rows_html}</table></div>"
-    )
+def fmt_ml(ml):
+    return f"{'+' if ml > 0 else '-' if ml < 0 else ''}{abs(int(ml))}"
+
+
+def ml_sub(ml, title):
+    """Small, light, italic line printed under a probability."""
+    if ml is None:
+        return ""
+    return f"<br><span class=\"ml\" title=\"{title}\">{fmt_ml(ml)}</span>"
 
 
 def _nice_axis(lo, hi, min_span, n_ticks=5):
@@ -722,7 +724,71 @@ def _nice_axis(lo, hi, min_span, n_ticks=5):
     return a_lo, a_hi, ticks, step
 
 
-def render_wallet_chart_svg(bank_days, ll_delta_series, start_bank, season_start, season_end, width=760):
+def build_day_tips(bank_days, instances):
+    """{date: tooltip html} for every settled day on the daily-result chart: the day's record, dollars, return,
+    bank, LogLoss (bets placed and all games) and each bet. instances = the detail season's team-game instances."""
+    by_date = group_by(instances, lambda x: x["date"])
+
+    def ll_line(label, ll, vll):
+        if ll is None or vll is None:
+            return f"<div>{label}: -</div>"
+        return f"<div>{label}: {ll:.3f} vs mkt {vll:.3f} ({ll - vll:+.3f})</div>"
+
+    tips = {}
+    for d, bank_end, result in bank_days:
+        xs = by_date.get(d, [])
+        s = aggregate(xs)
+        n_games = len({x["game_id"] for x in xs})
+        color = "#7ee2a0" if result >= 0 else "#ff8a80"
+        ret = f" ({s['return_pct']:+.1%} on ${s['wagered']:,.0f})" if s["return_pct"] is not None else ""
+        parts = [f"<div><b>{d.strftime('%a, %b')} {d.day}</b></div>",
+                 f"<div>Bets: {s['bets_placed']} ({s['wins']}-{s['losses']}) &middot; {n_games} games played</div>",
+                 f"<div>Result: <span style=\"color:{color}; font-weight:600;\">{money(result)}</span>{ret}</div>",
+                 f"<div>Bank after: ${bank_end:,.0f}</div>",
+                 ll_line("LogLoss, bets", s["bet_model_logloss"], s["bet_market_logloss"]),
+                 ll_line(f"LogLoss, all {n_games} games", s["all_model_logloss"], s["all_market_logloss"])]
+        bets = sorted((x for x in xs if x["bets_fire"]), key=lambda x: (x["team"], x["game_id"]))
+        if bets:
+            parts.append("<div style=\"margin-top:4px; border-top:1px solid #555; padding-top:4px;\"></div>")
+        for x in bets:
+            c = "#7ee2a0" if x["win"] else "#ff8a80"
+            parts.append(f"<div>{html_lib.escape(x['team'].upper())} ${x['stake_dollar']:,.0f} &mdash; "
+                         f"<span style=\"color:{c};\">{'won' if x['win'] else 'lost'} {money(x['profit_dollar'])}</span></div>")
+        tips[d] = "".join(parts)
+    return tips
+
+
+HOVER_JS = """(function(){
+var svg=document.querySelector('svg[data-points]'),tip=document.getElementById('day-tip');
+if(!svg||!tip)return;
+var pts=[];try{pts=JSON.parse(svg.getAttribute('data-points'));}catch(e){return;}
+var radius=parseFloat(svg.getAttribute('data-radius'))||6;
+var hit=svg.querySelector('#day-hit'),hl=svg.querySelector('#day-hl');
+if(!hit||!pts.length)return;
+function nearest(ev){
+var m=svg.getScreenCTM();if(!m)return null;
+var pt=svg.createSVGPoint();pt.x=ev.clientX;pt.y=ev.clientY;
+var x=pt.matrixTransform(m.inverse()).x,best=null,bd=1e9;
+for(var i=0;i<pts.length;i++){var d=Math.abs(pts[i].x-x);if(d<bd){bd=d;best=pts[i];}}
+return bd<=radius?best:null;}
+function hide(){tip.style.display='none';if(hl)hl.setAttribute('visibility','hidden');}
+function show(ev){
+var p=nearest(ev);if(!p){hide();return;}
+tip.innerHTML=p.html;tip.style.display='block';
+if(hl){hl.setAttribute('x',p.x-parseFloat(hl.getAttribute('width'))/2);hl.setAttribute('visibility','visible');}
+var pad=14,w=tip.offsetWidth,h=tip.offsetHeight,x=ev.clientX+pad,y=ev.clientY+pad;
+if(x+w>window.innerWidth-4)x=ev.clientX-w-pad;
+if(y+h>window.innerHeight-4)y=ev.clientY-h-pad;
+tip.style.left=Math.max(4,x)+'px';tip.style.top=Math.max(4,y)+'px';}
+hit.addEventListener('pointermove',show);
+hit.addEventListener('pointerdown',show);
+hit.addEventListener('pointerleave',function(ev){if(ev.pointerType==='mouse')hide();});
+document.addEventListener('pointerdown',function(ev){if(ev.target!==hit)hide();});
+})();"""
+
+
+def render_wallet_chart_svg(bank_days, ll_delta_series, start_bank, season_start, season_end, width=760,
+                             day_tips=None):
     """Self-contained inline SVG (no chart library / CDN, so the page stays static on GitHub Pages).
 
     Two stacked panels sharing one x axis that spans the FULL season (season_start..season_end); lines and
@@ -732,7 +798,10 @@ def render_wallet_chart_svg(bank_days, ll_delta_series, start_bank, season_start
                       LL-delta zero line: below it the model has beaten the market, above it the market has
                       beaten the model.
       Bottom panel -- each day's total $ result (green up / red down).
-    bank_days: [(date, bank_at_end_of_day, result_dollars)]; ll_delta_series: [(date, cumulative avg delta)]."""
+    bank_days: [(date, bank_at_end_of_day, result_dollars)]; ll_delta_series: [(date, cumulative avg delta)].
+    day_tips: optional {date: tooltip html} (see build_day_tips). When given, hovering (or tapping) a daily-result
+    bar shows that day's tooltip -- handled by HOVER_JS, which reads the data-points / data-radius attributes
+    written onto the <svg> and listens on the transparent #day-hit overlay."""
     if not bank_days:
         return "<p class=\"meta\">No settled days yet this season.</p>"
 
@@ -833,13 +902,26 @@ def render_wallet_chart_svg(bank_days, ll_delta_series, start_bank, season_start
                    f'dominant-baseline="middle">{"$0" if abs(v) < 1e-9 else money(v)}</text>')
     svg.append(f'<line x1="{left}" x2="{left + plot_w}" y1="{y_b(0):.1f}" y2="{y_b(0):.1f}" stroke="#888" />')
     bar_w = max(2.0, min(14.0, plot_w / dspan * 0.7))
+    hover_points = []
     for d, _, r in bank_days:
         if abs(r) < 0.5:
             continue
         y0, y1 = y_b(0), y_b(r)
         svg.append(f'<rect x="{x_of(d) - bar_w / 2:.1f}" y="{min(y0, y1):.1f}" width="{bar_w:.1f}" '
                    f'height="{max(abs(y1 - y0), 1):.1f}" fill="{"#1a7f37" if r >= 0 else "#c0392b"}" />')
+        if day_tips and d in day_tips:
+            hover_points.append({"x": round(x_of(d), 1), "html": day_tips[d]})
     svg.append(f'<text x="{left + 6}" y="{p2_top - 8}" font-size="11" fill="#444">Daily result ($)</text>')
+    if hover_points:
+        # Highlight band (moved by HOVER_JS) and a transparent overlay over the whole bottom panel, so a bar a few
+        # pixels wide is easy to hit: the script picks the nearest bar within data-radius.
+        svg.append(f'<rect id="day-hl" x="0" y="{p2_top}" width="{bar_w + 6:.1f}" height="{p2_h}" fill="#333" '
+                   f'fill-opacity="0.08" visibility="hidden" pointer-events="none" />')
+        svg.append(f'<rect id="day-hit" x="{left}" y="{p2_top}" width="{plot_w}" height="{p2_h}" '
+                   f'fill="transparent" style="touch-action:pan-y; cursor:crosshair;" />')
+        radius = max(5.0, plot_w / dspan * 1.2)
+        data = html_lib.escape(json.dumps(hover_points), quote=True)
+        svg[0] = svg[0].replace("<svg ", f'<svg data-points="{data}" data-radius="{radius:.1f}" ', 1)
 
     # ---- legend ----
     svg.append(
@@ -858,7 +940,7 @@ def render_wallet_chart_svg(bank_days, ll_delta_series, start_bank, season_start
 
 
 def render_todays_games(rows, skater_data=None, goalie_data=None, bankroll=None, start_times=None,
-                        preview=None, odds_asof=None):
+                        preview=None, odds_asof=None, moneylines=None):
     if not rows:
         return "<p class=\"meta\">No games scheduled today.</p>"
     snaps, queue = skater_data if skater_data else ({}, {})
@@ -881,7 +963,7 @@ def render_todays_games(rows, skater_data=None, goalie_data=None, bankroll=None,
     if s_uniform:
         notes.append(f"Lineups as of {fmt_scraped(s_times[0])}")
     top_note = f"<p class=\"meta\">{' &middot; '.join(notes)} (last DailyFaceoff read)</p>" if notes else ""
-    start_times, preview = start_times or {}, preview or {}
+    start_times, preview, moneylines = start_times or {}, preview or {}, moneylines or {}
     if preview:
         asof = f" Live odds as of {fmt_scraped(odds_asof)}." if odds_asof else ""
         top_note += ("<p class=\"meta\">Rows tagged <b>prelim</b> use the current DraftKings line and the lineups/"
@@ -921,6 +1003,12 @@ def render_todays_games(rows, skater_data=None, goalie_data=None, bankroll=None,
             else:
                 snap_tag, prelim_tag = snap, ""
             mlpct = float(mlpct)
+            # Market line: the actual captured/live moneyline (stored with the frozen signal, or the live DraftKings
+            # line for a preview row); only if neither is known is it backed out of Market %. Model line: implied
+            # by the model's own win probability.
+            market_ml = pv["ml"] if is_prelim else moneylines.get((game_id, team))
+            if market_ml is None:
+                market_ml = ml_from_prob(mlpct)
             if mpct is None:  # preview with market line only (lineup/goalie not captured yet)
                 model_str, delta_str = "-", "-"
                 delta_color = "#666"
@@ -929,6 +1017,7 @@ def render_todays_games(rows, skater_data=None, goalie_data=None, bankroll=None,
                 delta = mpct - mlpct
                 delta_color = "#1a7f37" if delta > 0 else ("#c0392b" if delta < 0 else "#666")
                 model_str, delta_str = f"{mpct:.1%}", f"{delta:+.1%}"
+            model_ml = ml_from_prob(mpct) if mpct is not None else None
             if is_prelim and mpct is None:
                 bet_html = "<span class=\"tag\">-</span>"
             else:
@@ -944,8 +1033,8 @@ def render_todays_games(rows, skater_data=None, goalie_data=None, bankroll=None,
                 f"<span class=\"tag\">({snap_tag})</span></td>"
                 f"<td>{bet_html}</td>"
                 f"<td>{stake_str}</td>"
-                f"<td>{model_str}</td>"
-                f"<td>{mlpct:.1%}</td>"
+                f"<td>{model_str}{ml_sub(model_ml, 'Model-implied moneyline')}</td>"
+                f"<td>{mlpct:.1%}{ml_sub(market_ml, 'Actual moneyline')}</td>"
                 f"<td style=\"color:{delta_color}; font-weight:600;\">{delta_str}</td>"
                 f"{goalie_td}"
                 f"{check_td}"
@@ -1017,51 +1106,86 @@ def games_table_html(pairs):
 
 
 ROW_GRID_COLS = "1.3fr 0.6fr 0.9fr 0.9fr 0.8fr 0.7fr 0.6fr 0.6fr 0.6fr 0.6fr 0.6fr 0.6fr"
+# Season tables add a Wallet Return column (a bankroll concept, so it has no week/team equivalent).
+ROW_GRID_COLS_WALLET = "1.3fr 0.6fr 0.9fr 0.9fr 0.8fr 0.7fr 0.8fr 0.6fr 0.6fr 0.6fr 0.6fr 0.6fr 0.6fr"
+ROW_GRID_MIN_W = {False: 820, True: 920}
 
 
-def group_header_row():
-    """The shared, non-collapsible two-tier header sitting above a week/team block list -- printed once,
-    with each block's own summary row (see render_group_block) using the same grid so it lines up."""
+def group_header_row(first_label="", wallet=False):
+    """The shared, non-collapsible two-tier header sitting above a week/team/season block list -- printed once,
+    with each row (see grid_row_html) using the same grid so it lines up."""
+    cols = ROW_GRID_COLS_WALLET if wallet else ROW_GRID_COLS
+    min_w = f"min-width:{ROW_GRID_MIN_W[wallet]}px;" if wallet else ""  # non-wallet width is the .row-grid CSS default
+    n_blank = 6 + (1 if wallet else 0)
     return (
-        f"<div class=\"row-grid group-head\" style=\"grid-template-columns:{ROW_GRID_COLS};\">"
-        "<div></div><div></div><div></div><div></div><div></div><div></div>"
+        f"<div class=\"row-grid group-head\" style=\"grid-template-columns:{cols};{min_w}\">"
+        + "<div></div>" * n_blank +
         "<div class=\"group-label\" style=\"grid-column: span 3;\">LogLoss &mdash; Bets Placed</div>"
         "<div class=\"group-label\" style=\"grid-column: span 3;\">LogLoss &mdash; All Games</div>"
         "</div>"
-        f"<div class=\"row-grid col-head\" style=\"grid-template-columns:{ROW_GRID_COLS};\">"
-        "<div></div><div>Bets</div><div>Record</div><div>Wagered</div><div>Profit</div><div>Return</div>"
+        f"<div class=\"row-grid col-head\" style=\"grid-template-columns:{cols};{min_w}\">"
+        f"<div>{first_label}</div><div>Bets</div><div>Record</div><div>Wagered</div><div>Profit</div><div>Return</div>"
+        + ("<div>Wallet Return</div>" if wallet else "") +
         "<div>Model</div><div>Market</div><div>&Delta;</div>"
         "<div>Model</div><div>Market</div><div>&Delta;</div>"
         "</div>"
     )
 
 
-def render_group_block(label, instances, pairs):
-    s = aggregate(instances)
+def ll_cells(ll, vll):
+    delta = (ll - vll) if (ll is not None and vll is not None) else None
+    return (
+        f"<div>{f'{ll:.3f}' if ll is not None else '-'}</div>"
+        f"<div>{f'{vll:.3f}' if vll is not None else '-'}</div>"
+        f"<div style=\"{logloss_delta_bg(delta)}\">{f'{delta:+.3f}' if delta is not None else '-'}</div>"
+    )
+
+
+def grid_row_html(label, s, wallet_pct=None, wallet=False, bold=False, pct_in_record=False):
+    """One summary row in the shared grid -- used by the week/team/yesterday blocks and by the season tables, so
+    all of them share one set of font sizes, spacing and column order."""
     win_pct = f"{s['wins']}-{s['losses']}" if s["bets_placed"] else "0-0"
+    if pct_in_record and s["bets_placed"]:
+        win_pct += f" ({s['wins'] / s['bets_placed']:.0%})"
     profit_color = "#1a7f37" if s["profit"] >= 0 else "#c0392b"
     return_str = f"{s['return_pct']:+.1%}" if s["return_pct"] is not None else "-"
-
-    def ll_cells(ll, vll):
-        delta = (ll - vll) if (ll is not None and vll is not None) else None
-        return (
-            f"<div>{f'{ll:.3f}' if ll is not None else '-'}</div>"
-            f"<div>{f'{vll:.3f}' if vll is not None else '-'}</div>"
-            f"<div style=\"{logloss_delta_bg(delta)}\">{f'{delta:+.3f}' if delta is not None else '-'}</div>"
-        )
-
-    summary_row = (
-        f"<div class=\"row-grid\" style=\"grid-template-columns:{ROW_GRID_COLS};\">"
+    wallet_cell = ""
+    if wallet:
+        if wallet_pct is not None:
+            wr_color = "#1a7f37" if wallet_pct >= 0 else "#c0392b"
+            wallet_cell = f"<div style=\"color:{wr_color}; font-weight:600;\">{wallet_pct:+.1%}</div>"
+        else:
+            wallet_cell = "<div>-</div>"
+    cols = ROW_GRID_COLS_WALLET if wallet else ROW_GRID_COLS
+    extra = f"min-width:{ROW_GRID_MIN_W[wallet]}px;" if wallet else ""
+    if bold:
+        extra += " font-weight:700; border-top:2px solid #ccc;"
+    return (
+        f"<div class=\"row-grid\" style=\"grid-template-columns:{cols};{extra}\">"
         f"<div class=\"block-title\">{label}</div>"
         f"<div>{s['bets_placed']}</div><div>{win_pct}</div>"
         f"<div>${s['wagered']:,.0f}</div>"
         f"<div style=\"color:{profit_color}; font-weight:600;\">{money(s['profit'])}</div>"
         f"<div>{return_str}</div>"
+        f"{wallet_cell}"
         f"{ll_cells(s['bet_model_logloss'], s['bet_market_logloss'])}"
         f"{ll_cells(s['all_model_logloss'], s['all_market_logloss'])}"
         "</div>"
     )
 
+
+def season_grid_html(first_label, rows):
+    """Season-level table (the at-a-glance row and the past-seasons list) in the same grid as the week/team
+    blocks. rows: [(label, summary, wallet_return_pct, bold)]."""
+    body = "".join(grid_row_html(lbl, s, wallet_pct=wr, wallet=True, bold=bold, pct_in_record=True)
+                   for lbl, s, wr, bold in rows)
+    return (f"<div class=\"scroll-wrap\">{group_header_row(first_label, wallet=True)}"
+            f"<div class=\"block\">{body}</div></div>")
+
+
+def render_group_block(label, instances, pairs):
+    s = aggregate(instances)
+    summary_row = grid_row_html(label, s)
     bet_pairs = [p for p in pairs if p["away"]["bets_fire"] or p["home"]["bets_fire"]]
     return (
         "<details class=\"block\"><summary>" + summary_row + "</summary>"
@@ -1089,44 +1213,31 @@ def render_nested_drilldown(groups_sorted, label_fn, all_pairs_by_game_id):
 def render_html(model_version, bankroll, todays_rows, detail_season, week_groups, team_groups,
                 season_summaries, pairs_by_game_id, wallet_returns, detail_season_summary, chart_svg,
                 skater_data=None, callout_html="", goalie_data=None, yesterday_html="", yesterday_label="",
-                start_times=None, preview=None, odds_asof=None):
+                start_times=None, preview=None, odds_asof=None, moneylines=None, total_summary=None):
     season_disp = f"{detail_season[:2]}-{detail_season[2:]}"
 
     week_html = render_nested_drilldown(week_groups, lambda k: f"Week {k}", pairs_by_game_id)
     team_html = render_nested_drilldown(team_groups, lambda k: k.upper(), pairs_by_game_id)
 
-    season_rows_html = ""
-    totals = {"n_instances": 0, "bets_placed": 0, "wins": 0, "losses": 0, "wagered": 0.0, "profit": 0.0,
-              "model_logloss": None, "market_logloss": None}
-    ll_sum = ll_n = vll_sum = vll_n = 0
+    # Past seasons: one row per configured season plus a Total row. Total LogLoss is pooled over every instance
+    # (total_summary), not an average of the per-season averages, so a short season does not count as much as a
+    # full one. Total wallet return % = total dollar wallet return / total starting bankroll across seasons.
+    season_rows = []
     total_wallet_return_dollar = 0.0
     total_starting_bankroll = 0.0
     for season, s in season_summaries:
         disp = f"{season[:2]}-{season[2:]}"
-        wr_pct = wallet_returns.get(season, {}).get("wallet_return_pct")
-        season_rows_html += summary_row_html(disp, s, wallet_return_pct=wr_pct)
-        totals["bets_placed"] += s["bets_placed"]; totals["wins"] += s["wins"]; totals["losses"] += s["losses"]
-        totals["wagered"] += s["wagered"]; totals["profit"] += s["profit"]
         season_wr = wallet_returns.get(season, {})
+        season_rows.append((disp, s, season_wr.get("wallet_return_pct"), False))
         if season_wr.get("wallet_return") is not None:
             total_wallet_return_dollar += season_wr["wallet_return"]
             total_starting_bankroll += season_wr["starting_bankroll"]
-        if s["model_logloss"] is not None:
-            ll_sum += s["model_logloss"]; ll_n += 1
-        if s["market_logloss"] is not None:
-            vll_sum += s["market_logloss"]; vll_n += 1
-    totals["model_logloss"] = ll_sum / ll_n if ll_n else None
-    totals["market_logloss"] = vll_sum / vll_n if vll_n else None
-    totals["return_pct"] = (totals["profit"] / totals["wagered"]) if totals["wagered"] else None
-    if season_summaries:
-        # Total wallet return %: total dollar wallet return across seasons / total starting bankroll
-        # across seasons -- a weighted average, same spirit as how the Return% total is total profit /
-        # total wagered rather than an unweighted average of each season's own %.
+    if season_summaries and total_summary is not None:
         total_wr_pct = (total_wallet_return_dollar / total_starting_bankroll) if total_starting_bankroll else None
-        season_rows_html += summary_row_html("Total", totals, wallet_return_pct=total_wr_pct, bold=True)
+        season_rows.append(("Total", total_summary, total_wr_pct, True))
 
     detail_wr_pct = wallet_returns.get(detail_season, {}).get("wallet_return_pct")
-    detail_row_html = summary_row_html(season_disp, detail_season_summary, wallet_return_pct=detail_wr_pct)
+    detail_rows = [(season_disp, detail_season_summary, detail_wr_pct, False)]
 
     bankroll_str = f"${bankroll:,.0f}" if bankroll is not None else "-"
     html = (
@@ -1140,9 +1251,9 @@ def render_html(model_version, bankroll, todays_rows, detail_season, week_groups
         f"Page rendered {fmt_clock(datetime.now(timezone.utc))} ET</div>"
         f"{callout_html}"
         "<h2>Today's games</h2>"
-        f"{render_todays_games(todays_rows, skater_data, goalie_data, bankroll, start_times, preview, odds_asof)}"
+        f"{render_todays_games(todays_rows, skater_data, goalie_data, bankroll, start_times, preview, odds_asof, moneylines)}"
         f"<h2>{season_disp} at a glance</h2>"
-        f"{summary_table_html('Season', detail_row_html)}"
+        f"{season_grid_html('Season', detail_rows)}"
         f"<h2>{season_disp} &mdash; wallet &amp; LogLoss over time</h2>"
         f"{chart_svg}"
         f"<h2>Yesterday's games{yesterday_label}</h2>"
@@ -1152,7 +1263,9 @@ def render_html(model_version, bankroll, todays_rows, detail_season, week_groups
         f"<h2>{season_disp} &mdash; by team</h2>"
         f"{team_html if team_html else '<p class=\"meta\">No settled games yet this season.</p>'}"
         "<h2>Past seasons</h2>"
-        f"{summary_table_html('Season', season_rows_html)}"
+        f"{season_grid_html('Season', season_rows)}"
+        f"<div id=\"day-tip\" class=\"day-tip\"></div>"
+        f"<script>{HOVER_JS}</script>"
         "</body></html>"
     )
     return html
@@ -1177,6 +1290,7 @@ def main():
         # Earliest puck drop first (game_id order otherwise); games with no known time keep game_id order at the end.
         _far = datetime.max.replace(tzinfo=timezone.utc)
         todays_rows = sorted(todays_rows, key=lambda r: (start_times.get(r[0], _far), r[0]))
+        moneylines = get_todays_moneylines(conn, [r[0] for r in todays_rows])
         skater_data = get_skater_check_data(conn, [r[0] for r in todays_rows])
         goalie_data = get_goalie_data(conn, [r[0] for r in todays_rows])
         callout_html = render_attention_callout(*get_attention_callout(conn))
@@ -1208,7 +1322,8 @@ def main():
             chart_bank = season_bank if detail_season == current_season else get_season_bank(conn, detail_season)
             season_end = get_season_end_date(conn, detail_season, starts[detail_season])
             chart_svg = render_wallet_chart_svg(chart_bank["days"], cumulative_avg_ll_delta_series(detail_instances),
-                                                chart_bank["start"], starts[detail_season], season_end)
+                                                chart_bank["start"], starts[detail_season], season_end,
+                                                day_tips=build_day_tips(chart_bank["days"], detail_instances))
         else:
             chart_svg = "<p class=\"meta\">No settled days yet this season.</p>"
 
@@ -1218,6 +1333,7 @@ def main():
         # Every configured season gets a row, even one with zero games played (2627 before opening
         # night) -- by_season only has keys for seasons that actually returned instances.
         season_summaries = [(s, aggregate(by_season.get(s, []))) for s in sorted(all_seasons)]
+        total_summary = aggregate(all_instances)
         wallet_returns = get_season_wallet_returns(conn)
     finally:
         conn.close()
@@ -1228,7 +1344,7 @@ def main():
                             week_groups, team_groups, season_summaries, pairs_by_game_id,
                             wallet_returns, detail_season_summary, chart_svg,
                             skater_data, callout_html, goalie_data, yesterday_html, yesterday_label,
-                            start_times, preview, odds_asof))
+                            start_times, preview, odds_asof, moneylines, total_summary))
     print(f"Dashboard written to {OUTPUT_PATH}")
 
 
