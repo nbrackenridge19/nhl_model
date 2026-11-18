@@ -1,0 +1,111 @@
+name: NHL Live Refresh (pre-game preview, lineups/goalies + dashboard)
+
+# Keeps the dashboard's pre-game "prelim" rows fresh from the morning until puck drop, on Cloudflare's clock
+# instead of GitHub's.
+#
+# WHY THIS EXISTS
+# The preview rows on the dashboard need two things to be recent: the preliminary lineup/goalie rows
+# (lineup-goalie-preliminary.yml, scheduled every 30 min) and a fresh dashboard render (dashboard.yml, scheduled every
+# 10 min). Both ride GitHub's cron, which in practice ran about once an hour with gaps of 5-9 hours, so
+# the only reliably fresh view was the one the T-5 trigger produced. The Cloudflare Worker's own 30-minute cron tick
+# is the one reliable clock in the system: it already fires the "t5-schedule" repository_dispatch that runs
+# t5-scheduler.yml. This workflow listens for the same event, so it needs no Worker change.
+#
+# WHAT IT DOES (each tick, only when a game starts within WINDOW_HOURS)
+#   1. Re-reads DailyFaceoff and REPLACES the live 'preliminary' lineup/goalie rows for today's games
+#      (RUN_MODE=preliminary). It never freezes anything: the T-5 run (t5-trigger.yml) is still the one and only
+#      freeze, and bet_signals is never touched here.
+#   2. Starts dashboard.yml so the page re-renders with those rows and the live DraftKings line.
+# Nothing is written for games that have already started or are frozen -- the ingest skips them itself.
+#
+# SAFETY
+#   - Additive: the existing GitHub crons keep running as a backup; this just makes sure a refresh really happens.
+#   - Concurrency group is shared with lineup-goalie-preliminary.yml so two live refreshes never write the same
+#     team-game rows at the same moment.
+#   - Manual run: Actions > NHL Live Refresh > Run workflow (dry_run defaults to true there; scheduled ticks are live).
+
+on:
+  repository_dispatch:
+    types: [t5-schedule]
+  workflow_dispatch:
+    inputs:
+      window_hours:
+        description: 'Only refresh if a game starts within this many hours'
+        required: true
+        default: '6'
+        type: string
+      dry_run:
+        description: 'Dry run (true = no DB writes, no dashboard run)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+permissions:
+  contents: read
+  actions: write   # lets the last step start dashboard.yml
+
+concurrency:
+  group: lineup-prelim-ingest
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests psycopg2-binary
+
+      - name: Is any game close enough to be worth refreshing?
+        id: gate
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGPORT: ${{ secrets.PGPORT }}
+          WINDOW_HOURS: ${{ github.event.inputs.window_hours || '6' }}
+        run: |
+          python - <<'PY'
+          import os, psycopg2
+          hrs = float(os.environ["WINDOW_HOURS"])
+          conn = psycopg2.connect()
+          with conn.cursor() as cur:
+              cur.execute("select count(*) from games where playoff = false and home_goals is null "
+                          "and start_time > now() and start_time <= now() + (%s * interval '1 hour')", (hrs,))
+              n = cur.fetchone()[0]
+          conn.close()
+          print(f"Games starting in the next {hrs:g}h: {n}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"run={'true' if n else 'false'}\n")
+          PY
+
+      - name: Refresh preliminary lineups and goalies (live rows only, nothing freezes)
+        if: steps.gate.outputs.run == 'true'
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGPORT: ${{ secrets.PGPORT }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          RUN_MODE: preliminary
+          LOOKAHEAD_DAYS: '0'   # today's games only
+        run: python scripts/nhl_lineup_goalie_ingest.py
+
+      - name: Re-render the dashboard
+        if: steps.gate.outputs.run == 'true' && (github.event.inputs.dry_run || 'false') != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run dashboard.yml --repo "${{ github.repository }}"
