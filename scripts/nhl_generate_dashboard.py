@@ -417,10 +417,14 @@ def get_attention_callout(conn):
         results = [r[0] for r in cur.fetchall()]
         cur.execute("select count(*) from player_id_review_queue where status = 'open'")
         unmatched = cur.fetchone()[0]
+        # Keep the game filter as "v.game_id = any (array(...))". Written as a join to games, Postgres computes
+        # PVAdj for every lineup row ever saved before filtering, which grew past the 2-minute statement timeout.
         cur.execute("""
             select count(distinct v.player_id)
-            from v_pregame_lineup_pvadj_players v join games g on g.game_id = v.game_id
-            where v.pvadj is null and g.playoff = false and g.home_goals is null and g.date >= current_date - 1""")
+            from v_pregame_lineup_pvadj_players v
+            where v.pvadj is null
+              and v.game_id = any (array(select game_id from games
+                                         where playoff = false and home_goals is null and date >= current_date - 1))""")
         nostats = cur.fetchone()[0]
     return results, unmatched, nostats
 

@@ -13,6 +13,12 @@ on:
 permissions:
   contents: write
 
+# One dashboard run at a time. Several T-5 runs with the same puck drop each start a refresh; GitHub runs the
+# first, keeps only the newest of the rest waiting, and cancels the others (shown as "cancelled", not failed).
+concurrency:
+  group: dashboard
+  cancel-in-progress: false
+
 jobs:
   generate:
     runs-on: ubuntu-latest

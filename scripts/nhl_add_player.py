@@ -430,11 +430,15 @@ def open_null_pvadj_rows(cur):
     """Skaters in a lineup snapshot for a game that hasn't been played, who matched a player row (often a
     veteran with an old Hockey-Reference id) but have no prior-season / rookie stats -> PVAdj is NULL.
     These never appear in either review queue, so they're found straight from the pvadj view."""
+    # The "v.game_id = any (array(...))" filter is what limits the work to upcoming games; filtering only through
+    # the join to games makes Postgres compute PVAdj for every lineup row ever saved.
     cur.execute("""
         select v.player_id, v.player_name_display, v.team_code, min(v.game_id) as first_game
         from v_pregame_lineup_pvadj_players v
         join games g on g.game_id = v.game_id
-        where v.pvadj is null and g.playoff = false and g.home_goals is null and g.date >= current_date - 1
+        where v.pvadj is null
+          and v.game_id = any (array(select game_id from games
+                                     where playoff = false and home_goals is null and date >= current_date - 1))
         group by 1, 2, 3
         order by min(g.date), 2""")
     return cur.fetchall()
