@@ -108,7 +108,10 @@ SEASON ROLLOVER CHANGES (2026-27) — see chat for the reasoning behind each
 9. Refresh chain fixed: it now includes v_team_game_perspective (without it
    new games never reached the bet/result views). The v2/v4 experiment chain
    is refreshed only when REFRESH_EXPERIMENTAL=true. Each view is refreshed
-   and committed on its own.
+   and committed on its own. Every live run refreshes the chain, even when it
+   ingested nothing, and each view is retried after a wait: a run that crashed
+   mid-chain (the database restarted during v_team_game_perspective on
+   2026-11-25) is repaired by the next run instead of leaving the views stale.
 10. After a game is ingested, its 'confirmed' lineup_snapshots row is
     overwritten with the actual skaters from the box score -- see
     overwrite_confirmed_snapshots(). The starting goalie for SvPctR
@@ -170,6 +173,8 @@ REGRESSION_CONSTANTS_BY_SEASON = {
 }
 LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "7"))
 REFRESH_EXPERIMENTAL = os.environ.get("REFRESH_EXPERIMENTAL", "false").strip().lower() == "true"
+REFRESH_ATTEMPTS = 3  # tries per materialized view before the run fails
+REFRESH_RETRY_WAIT_SECONDS = 120  # long enough for a restarting database to accept connections again
 
 
 def regression_constants(season):
@@ -817,23 +822,34 @@ EXPERIMENTAL_REFRESH_CHAIN = [
 ]
 
 
-def refresh_materialized_views(conn_factory):
-    chain = list(MAIN_REFRESH_CHAIN) + (EXPERIMENTAL_REFRESH_CHAIN if REFRESH_EXPERIMENTAL else [])
-    for view in chain:
+def refresh_view(conn_factory, view):
+    """Refresh one view on its own connection, retrying on a fresh connection if it fails."""
+    for attempt in range(1, REFRESH_ATTEMPTS + 1):
         t0 = time.time()
-        conn = conn_factory()
+        conn = None
         try:
+            conn = conn_factory()
             with conn.cursor() as cur:
                 cur.execute("set statement_timeout = 0")  # v_team_game_perspective alone takes ~2 minutes
                 cur.execute(f"refresh materialized view {view}")
             conn.commit()
             print(f"  refreshed {view} ({time.time() - t0:.0f}s)")
-        except Exception as e:  # stop: everything downstream would be stale/inconsistent
-            conn.rollback()
-            print(f"  FAILED refreshing {view}: {e}")
-            raise
+            return
+        except Exception as e:
+            print(f"  FAILED refreshing {view} (attempt {attempt} of {REFRESH_ATTEMPTS}): {e}")
+            if attempt == REFRESH_ATTEMPTS:
+                raise  # stop: everything downstream would be stale/inconsistent
+            time.sleep(REFRESH_RETRY_WAIT_SECONDS)
         finally:
-            conn.close()
+            # close() discards any open transaction; no explicit rollback, which itself raises on a dead connection
+            if conn is not None:
+                conn.close()
+
+
+def refresh_materialized_views(conn_factory):
+    chain = list(MAIN_REFRESH_CHAIN) + (EXPERIMENTAL_REFRESH_CHAIN if REFRESH_EXPERIMENTAL else [])
+    for view in chain:
+        refresh_view(conn_factory, view)
     print("Refreshed materialized view chain.")
 
 
@@ -1247,7 +1263,7 @@ def main():
         return
 
     conn = get_db_conn()
-    total, failures = 0, []
+    failures = []
     try:
         if explicit:
             dates = [date.fromisoformat(explicit)]
@@ -1262,14 +1278,15 @@ def main():
             prior_season = prior_season_code(season)
             print(f"== {d} (season {season}, prior {prior_season}) ==")
             n, fails = process_date(conn, d, season, prior_season)
-            total += n
             failures += fails
             print(f"  {n} game(s) ingested for {d}")
-
-        if total and not DRY_RUN:
-            refresh_materialized_views(get_db_conn)
     finally:
         conn.close()
+
+    # Refresh even when nothing new was ingested: an earlier run may have saved games and then failed
+    # partway through the refresh, and those games now count as "already ingested".
+    if not DRY_RUN:
+        refresh_materialized_views(get_db_conn)
 
     if failures:
         print("WARNING - games that could not be ingested (retried automatically while inside the lookback window):")
