@@ -18,6 +18,9 @@ name: NHL T-5 Trigger (odds + confirmed lineup/goalie + signal)
 # for it. Odds go in AFTER the confirmed lineup/goalie, so the cron can never see odds
 # without the confirmed snapshots already being there.
 #
+# If DailyFaceoff refuses a request, steps 1-3 and the dashboard refresh still run (the signal falls back to the
+# preliminary data), and the last step then fails the run so it shows red in Actions.
+#
 # Fallbacks: the nightly confirmed lineup/goalie sweep (11pm ET) and the odds-ingest cron
 # (which only captures games already at or past puck drop) are backups for a game whose T-5
 # run failed. Both scripts' inserts are never-overwrite, so there's no double-write risk.
@@ -76,6 +79,7 @@ jobs:
           echo "dry_run: ${{ steps.params.outputs.dry_run }}"
 
       - name: Capture confirmed lineup/goalie
+        id: lineup
         env:
           PGHOST: ${{ secrets.PGHOST }}
           PGUSER: ${{ secrets.PGUSER }}
@@ -116,3 +120,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run dashboard.yml --repo "${{ github.repository }}"
+
+      # Deliberately last: the odds, signal and dashboard refresh above have already happened.
+      - name: Flag failed DailyFaceoff requests
+        if: steps.lineup.outputs.dfo_failures != ''
+        env:
+          DFO_FAILURES: ${{ steps.lineup.outputs.dfo_failures }}
+        run: |
+          echo "$DFO_FAILURES"
+          echo "No new confirmed data was saved for those requests. The signal may rest on preliminary lineups/goalies."
+          exit 1

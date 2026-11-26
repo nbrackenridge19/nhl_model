@@ -53,12 +53,20 @@ SAFETY
 --------------------------------------------------------------------------
 DRY_RUN defaults to true. RUN_MODE is required. Preliminary looks at games within LOOKAHEAD_DAYS (default 2),
 regular season only.
+
+FAILED REQUESTS
+--------------------------------------------------------------------------
+A refused or unreadable DailyFaceoff page (e.g. HTTP 403) is flagged as a GitHub Actions annotation: an error in
+RUN_MODE=confirmed, a warning in RUN_MODE=preliminary (the next refresh replaces that data). The script still
+exits 0 so the T-5 odds capture and signal freeze go ahead; the list is also written to the step output
+dfo_failures, and t5-trigger.yml fails the run on it after those steps.
 """
 
 import os
 import re
 import time
 import unicodedata
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 
 import psycopg2
@@ -85,6 +93,9 @@ HEADERS = {
 }
 DFO_LINES_URL = "https://www.dailyfaceoff.com/teams/{slug}/line-combinations"
 DFO_GOALIES_URL = "https://www.dailyfaceoff.com/starting-goalies/{d}"
+
+# (what was requested, why it failed) for every DailyFaceoff request that got no usable page in this run
+FETCH_FAILURES = []
 
 FEED_TO_INTERNAL = {"tb": "tbl", "sj": "sjs", "nj": "njd", "la": "lak", "vgk": "veg", "was": "wsh", "utah": "uta"}
 
@@ -409,6 +420,7 @@ def lineup_snapshot_pass(conn, today, queue_rows):
         team_code, players, err = fetch_team_lines(slug)
         if err:
             print(f"  {expected_code} ({slug}): FAILED ({err})")
+            FETCH_FAILURES.append((f"{expected_code} lineup", err))
             time.sleep(REQUEST_DELAY_SECONDS)
             continue
         if team_code != expected_code:
@@ -455,6 +467,7 @@ def goalie_snapshot_pass(conn, today, queue_rows):
         games, err = fetch_goalies_for_date(d)
         if err:
             print(f"  {d}: FAILED ({err})")
+            FETCH_FAILURES.append((f"goalies {d}", err))
             time.sleep(REQUEST_DELAY_SECONDS)
             continue
         if not games:
@@ -577,6 +590,27 @@ def freeze_missed(conn_factory, today):
         conn.close()
 
 
+def report_fetch_failures():
+    """Put failed DailyFaceoff requests where they can be seen: a GitHub Actions annotation, plus the step output
+    dfo_failures. See FAILED REQUESTS in the module docstring."""
+    if not FETCH_FAILURES:
+        return
+    reasons = Counter(reason for _, reason in FETCH_FAILURES)
+    summary = (f"{len(FETCH_FAILURES)} DailyFaceoff request(s) failed ("
+               + ", ".join(f"{reason} x{n}" for reason, n in reasons.most_common()) + "): "
+               + ", ".join(label for label, _ in FETCH_FAILURES[:6])
+               + (f" and {len(FETCH_FAILURES) - 6} more" if len(FETCH_FAILURES) > 6 else ""))
+    if TARGET_GAME_ID:
+        summary = f"{TARGET_GAME_ID}: {summary}"
+    summary = " ".join(summary.split())  # annotations and step outputs must stay on one line
+    level = "error" if RUN_MODE == "confirmed" else "warning"
+    print(f"::{level} title=DailyFaceoff request failed::{summary.replace('%', '%25')}")
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if output_path:
+        with open(output_path, "a", encoding="utf-8") as f:
+            f.write(f"dfo_failures={summary}\n")
+
+
 def main():
     today = et_today()
     print(f"NHL lineup/goalie ingest -- DRY_RUN={DRY_RUN} -- RUN_MODE={RUN_MODE} -- TARGET_GAME_ID={TARGET_GAME_ID} -- "
@@ -598,6 +632,7 @@ def main():
     write_snapshots(get_db_conn, "lineup_snapshots", lineup_rows, lineup_replace)
     write_snapshots(get_db_conn, "goalie_snapshots", goalie_rows)
     write_review_queue(get_db_conn, queue_rows)
+    report_fetch_failures()
     print("Done.")
 
 

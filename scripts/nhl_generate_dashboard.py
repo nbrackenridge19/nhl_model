@@ -399,6 +399,8 @@ def skater_check_cell(game_id, team, signal_snap, snaps, queue, show_time=True):
         issues.append(f"{d['n_null']} with no PVAdj: " + ", ".join(d["names"]))
     if n != 18 and not issues:
         issues.append(f"DailyFaceoff lists only {n} skaters (no unmatched players, so likely genuine)")
+    if signal_snap == "preliminary":
+        issues.append("<b>signal frozen without full confirmed data</b>")
     if not issues:
         return (f"<td style=\"color:#1a7f37;\">{n}/18 <span class=\"tag\">({snap})</span>"
                 f"{scraped_note(d['scraped'], show_time)}</td>")
@@ -441,6 +443,20 @@ def render_attention_callout(results, unmatched, nostats):
         return ""
     return ("<div class=\"attn\"><b>Needs attention:</b> " + "; ".join(parts) +
             f".<br>Run <code>{ADD_PLAYER_CMD}</code> locally.</div>")
+
+
+def render_preliminary_signal_callout(rows):
+    """Top-of-page flag for today's games (get_todays_games rows) whose frozen signal used preliminary data: the
+    T-5 confirmed capture did not fully complete, for example because DailyFaceoff refused the request."""
+    games = []
+    for (_gid, home, away, h_fire, _s1, _m1, _l1, h_snap, a_fire, _s2, _m2, _l2, a_snap) in rows:
+        if "preliminary" in (h_snap, a_snap):
+            games.append(f"{away.upper()} @ {home.upper()}" + (" (BET)" if h_fire or a_fire else ""))
+    if not games:
+        return ""
+    return ("<div class=\"attn\"><b>Signal frozen without full confirmed data:</b> " + ", ".join(games) +
+            ".<br>At least one lineup or goalie was still preliminary when the signal froze. Check the current "
+            "lineups before relying on it; the game's T-5 run in GitHub Actions shows any refused request.</div>")
 
 
 # --------------------------- historical instances ---------------------------
@@ -1427,7 +1443,8 @@ def main():
         moneylines = get_todays_moneylines(conn, [r[0] for r in todays_rows])
         skater_data = get_skater_check_data(conn, [r[0] for r in todays_rows])
         goalie_data = get_goalie_data(conn, [r[0] for r in todays_rows])
-        callout_html = render_attention_callout(*get_attention_callout(conn))
+        callout_html = (render_preliminary_signal_callout(todays_rows)
+                        + render_attention_callout(*get_attention_callout(conn)))
 
         detail_season = get_detail_season(conn)
         print(f"Detail season: {detail_season}")
